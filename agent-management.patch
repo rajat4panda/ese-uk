@@ -1,0 +1,1935 @@
+diff --git a/app/api/agents.py b/app/api/agents.py
+index d75bc8b..07e22fa 100644
+--- a/app/api/agents.py
++++ b/app/api/agents.py
+@@ -1,6 +1,7 @@
+ """Recruitment agent register and performance (FR-102–FR-107, LLD 3.11, prototype screen 11).
+ 
+-The register is read-only here. Performance is derived from the applications already attributed to
++The register is maintained here too: add, correct, suspend and hold evidence (BRD FR-90 to FR-94);
++the rules live in services/agents.py. Performance is derived from the applications already attributed to
+ each agent rather than stored, so the figures cannot drift from the records they describe: an agent
+ row is a view over its applications, offers, CAS and enrolments, not a second copy of them.
+ 
+@@ -12,20 +13,27 @@ refusal out of three applications is noise, and showing it as 33% invites a deci
+ from __future__ import annotations
+ 
+ from decimal import Decimal
++from urllib.parse import quote
+ 
+-from fastapi import APIRouter, Depends
++from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
++from fastapi.responses import StreamingResponse
+ from sqlalchemy import Select, func, select
+ from sqlalchemy.orm import Session
+ 
+-from app.api.deps import CurrentUser, require_roles
++from app.api.deps import CurrentUser, client_ip, require_roles
+ from app.api.reference import _countries
+ from app.database import get_db
++from app.errors import GuardFailed
+ from app.models.agent import Agent
+ from app.models.application import Application
+ from app.models.cas import Cas, VisaOutcomeRecord
+ from app.models.enums import EnrolmentStatus, UserRole, VisaOutcome
+ from app.models.offer import Offer
+ from app.models.student import StudentRecord
++from app.models.user import User
++from app.schemas.agent import AgentCreateIn, AgentStatusIn, AgentUpdateIn, EvidenceKind
++from app.services import agents as svc
++from app.services.settings import get_setting
+ 
+ router = APIRouter(tags=["agents"])
+ 
+@@ -105,7 +113,9 @@ def list_agents(
+             "id": a.id,
+             "name": a.name,
+             "country": names.get(a.country, a.country),
++            "country_code": a.country,
+             "status": a.status,
++            "status_reason": a.status_reason,
+             "contact_name": a.contact_name,
+             "contact_email": a.contact_email,
+             "applications": c.get("applications", 0),
+@@ -121,3 +131,124 @@ def list_agents(
+             "next_review_date": a.next_review_date,
+         })
+     return out
++
++
++# --- Maintaining the register (BRD FR-90 to FR-94) --------------------------------------------
++AGENT_EDIT = tuple(svc.EDIT_ROLES)
++
++
++def _detail(db: Session, a: Agent) -> dict:
++    names = {c["code"]: c["name"] for c in _countries()}
++    evidence = {}
++    for kind, doc in svc.evidence_documents(db, a).items():
++        if doc is None:
++            evidence[kind] = None
++            continue
++        uploader = db.get(User, doc.uploaded_by)
++        evidence[kind] = {"id": doc.id, "filename": doc.filename, "uploaded_at": doc.uploaded_at,
++                          "uploaded_by": uploader.full_name if uploader else None,
++                          "available": doc.scan_status == "clean"}  # fmt: skip
++    return {
++        "id": a.id,
++        "name": a.name,
++        "country_code": a.country,
++        "country": names.get(a.country, a.country),
++        "contact_name": a.contact_name,
++        "contact_email": a.contact_email,
++        "contact_phone": a.contact_phone,
++        "status": a.status,
++        "status_reason": a.status_reason,
++        "due_diligence_date": a.due_diligence_date,
++        "next_review_date": a.next_review_date,
++        "refusal_rate_threshold_pct": float(a.refusal_rate_threshold_pct)
++        if a.refusal_rate_threshold_pct is not None else None,
++        "evidence": evidence,
++        "evidence_history": [
++            {"id": d.id, "kind": "agreement" if d.category == "agent_agreement" else "due_diligence",
++             "filename": d.filename, "uploaded_at": d.uploaded_at,
++             "uploaded_by": (u.full_name if (u := db.get(User, d.uploaded_by)) else None),
++             "status": "quarantined" if d.scan_status != "clean" else ("superseded" if d.superseded_by else "current")}
++            for d in svc.history(db, a)
++        ],
++        "created_at": a.created_at,
++        "updated_at": a.updated_at,
++    }
++
++
++@router.get("/agents/{agent_id}")
++def get_agent(agent_id: int, current: CurrentUser = Depends(require_roles(*AGENT_VIEW)),
++              db: Session = Depends(get_db)) -> dict:  # fmt: skip
++    return _detail(db, svc.get(db, agent_id))
++
++
++@router.post("/agents", status_code=201)
++def create_agent(body: AgentCreateIn, request: Request, current: CurrentUser = Depends(require_roles(*AGENT_EDIT)),
++                 db: Session = Depends(get_db)) -> dict:  # fmt: skip
++    agent = svc.create(db, current.user, body, client_ip(request))
++    db.commit()
++    return _detail(db, agent)
++
++
++@router.patch("/agents/{agent_id}")
++def update_agent(agent_id: int, body: AgentUpdateIn, request: Request,
++                 current: CurrentUser = Depends(require_roles(*AGENT_EDIT)),
++                 db: Session = Depends(get_db)) -> dict:  # fmt: skip
++    agent = svc.update(db, current.user, agent_id, body, client_ip(request))
++    db.commit()
++    return _detail(db, agent)
++
++
++@router.post("/agents/{agent_id}/status")
++def set_agent_status(agent_id: int, body: AgentStatusIn, request: Request,
++                     current: CurrentUser = Depends(require_roles(*AGENT_EDIT)),
++                 db: Session = Depends(get_db)) -> dict:  # fmt: skip
++    agent = svc.set_status(db, current.user, agent_id, body.status, body.reason, client_ip(request))
++    db.commit()
++    return _detail(db, agent)
++
++
++@router.post("/agents/{agent_id}/evidence", status_code=201)
++def upload_agent_evidence(
++    agent_id: int,
++    request: Request,
++    kind: EvidenceKind = Form(...),
++    file: UploadFile = File(...),
++    current: CurrentUser = Depends(require_roles(*AGENT_EDIT)),
++    db: Session = Depends(get_db),
++) -> dict:
++    max_bytes = int(get_setting(db, "MAX_UPLOAD_BYTES", 5_242_880))
++    data = file.file.read(max_bytes + 1)
++    try:
++        svc.upload_evidence(db, current.user, agent_id, kind=kind, filename=file.filename, data=data,
++                            max_bytes=max_bytes, ip=client_ip(request))  # fmt: skip
++    except GuardFailed:
++        db.commit()  # keep the quarantine row and audit entries as evidence (FR-22)
++        raise
++    db.commit()
++    return _detail(db, svc.get(db, agent_id))
++
++
++def _stream(doc, stream) -> StreamingResponse:  # noqa: ANN001
++    ascii_name = doc.filename.encode("ascii", "ignore").decode().replace('"', "").replace("\\", "") or "document"
++    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(doc.filename)}"
++    return StreamingResponse(stream, media_type=doc.content_type,
++                             headers={"Content-Disposition": disposition, "Cache-Control": "no-store"})  # fmt: skip
++
++
++@router.get("/agents/{agent_id}/evidence/{kind}")
++def download_agent_evidence(agent_id: int, kind: str, request: Request,
++                            current: CurrentUser = Depends(require_roles(*AGENT_VIEW)),
++                            db: Session = Depends(get_db)):  # fmt: skip
++    doc, stream = svc.open_evidence(db, current.user, agent_id, kind, client_ip(request))
++    db.commit()  # document.view is written before any byte is served
++    return _stream(doc, stream)
++
++
++@router.get("/agents/{agent_id}/documents/{document_id}")
++def download_agent_document(agent_id: int, document_id: int, request: Request,
++                            current: CurrentUser = Depends(require_roles(*AGENT_VIEW)),
++                            db: Session = Depends(get_db)):  # fmt: skip
++    """Earlier evidence, superseded by a newer file but still on record (FR-91)."""
++    doc, stream = svc.open_document(db, current.user, agent_id, document_id, client_ip(request))
++    db.commit()
++    return _stream(doc, stream)
+diff --git a/app/main.py b/app/main.py
+index 45da6eb..49c9722 100644
+--- a/app/main.py
++++ b/app/main.py
+@@ -24,6 +24,13 @@ log = logging.getLogger("ese")
+ API_PREFIX = "/api/v1"
+ WEB_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+ UPLOAD_BODY_LIMIT = 5_242_880 + 64 * 1024  # file limit plus multipart overhead
++#: Every POST route that accepts a file. Both body-size guards below key on these suffixes, so a new
++#: upload route must be added here or it escapes the limit.
++UPLOAD_PATH_SUFFIXES = ("/documents", "/evidence")
++
++
++def is_upload_path(path: str) -> bool:
++    return path.endswith(UPLOAD_PATH_SUFFIXES)
+ 
+ CSP = (
+     "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; "
+@@ -45,7 +52,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
+         request.state.request_id = request_id[:64]
+ 
+         length = request.headers.get("content-length")
+-        if request.method == "POST" and request.url.path.endswith("/documents") and length and length.isdigit():
++        if request.method == "POST" and is_upload_path(request.url.path) and length and length.isdigit():
+             if int(length) > UPLOAD_BODY_LIMIT:
+                 # Refuse before the body is read (LLD 11.1 step 1). The edge proxy enforces the same limit.
+                 resp = JSONResponse(
+@@ -88,7 +95,7 @@ class BodySizeLimitMiddleware:
+         self.limit = limit
+ 
+     async def __call__(self, scope, receive, send):
+-        if scope["type"] != "http" or scope["method"] != "POST" or not scope["path"].endswith("/documents"):
++        if scope["type"] != "http" or scope["method"] != "POST" or not is_upload_path(scope["path"]):
+             await self.app(scope, receive, send)
+             return
+         received = 0
+diff --git a/app/models/agent.py b/app/models/agent.py
+index 188cbc5..eb856d6 100644
+--- a/app/models/agent.py
++++ b/app/models/agent.py
+@@ -4,12 +4,15 @@ the register, due-diligence and performance functions arrive in Sprint 5."""
+ from datetime import date, datetime
+ from decimal import Decimal
+ 
+-from sqlalchemy import BigInteger, Date, ForeignKey, Numeric, Text
++from sqlalchemy import BigInteger, Date, FetchedValue, ForeignKey, Numeric, Text, text
+ from sqlalchemy.orm import Mapped, mapped_column
+ 
+-from app.models.base import Base, created_at_col, pk
++from app.models.base import Base, UTCDateTime, created_at_col, pk
+ 
+ ATTRIBUTABLE_AGENT_STATUSES = ("active", "under_review")  # FR-106
++#: Every status the database allows (CHECK on agents.status). Suspended and deactivated agents stay
++#: on the register with their history; they simply cannot be attributed new applications (FR-94).
++AGENT_STATUSES = ("active", "under_review", "suspended", "deactivated")
+ 
+ 
+ class Agent(Base):
+@@ -27,4 +30,10 @@ class Agent(Base):
+     next_review_date: Mapped[date | None] = mapped_column(Date)
+     status: Mapped[str] = mapped_column(Text, nullable=False, server_default="active")
+     refusal_rate_threshold_pct: Mapped[Decimal | None] = mapped_column(Numeric(4, 1))
++    status_reason: Mapped[str | None] = mapped_column(Text)
+     created_at: Mapped[datetime] = created_at_col()
++    updated_at: Mapped[datetime] = mapped_column(
++        UTCDateTime(), nullable=False, server_default=text("now()"), server_onupdate=FetchedValue()
++    )
++
++    __mapper_args__ = {"eager_defaults": True}  # read updated_at back after the trigger sets it
+diff --git a/app/models/application.py b/app/models/application.py
+index 007e974..d69de93 100644
+--- a/app/models/application.py
++++ b/app/models/application.py
+@@ -91,7 +91,9 @@ class Document(Base):
+     __tablename__ = "documents"
+     __table_args__ = (
+         CheckConstraint("size_bytes <= 5242880", name="ck_documents_size"),
+-        CheckConstraint("application_id IS NOT NULL OR student_id IS NOT NULL", name="ck_documents_owner"),
++        CheckConstraint(
++            "application_id IS NOT NULL OR student_id IS NOT NULL OR agent_id IS NOT NULL", name="ck_documents_owner"
++        ),
+     )
+ 
+     id: Mapped[int] = pk()
+@@ -100,6 +102,7 @@ class Document(Base):
+     )
+     # FK to student_records(id) is added by the migration that creates student_records (Sprint 4).
+     student_id: Mapped[int | None] = mapped_column(BigInteger)
++    agent_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("agents.id", ondelete="RESTRICT"))
+     category: Mapped[DocumentCategory] = mapped_column(pg_enum("document_category"), nullable=False)
+     filename: Mapped[str] = mapped_column(Text, nullable=False)
+     storage_key: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+diff --git a/app/models/enums.py b/app/models/enums.py
+index 2f2399c..df2c0c2 100644
+--- a/app/models/enums.py
++++ b/app/models/enums.py
+@@ -59,6 +59,8 @@ class DocumentCategory(StrEnum):
+     ENROLMENT_EVIDENCE = "enrolment_evidence"
+     REPORT_EVIDENCE = "report_evidence"
+     OTHER = "other"
++    AGENT_AGREEMENT = "agent_agreement"  # FR-91, held against an agent, never an application
++    AGENT_DUE_DILIGENCE = "agent_due_diligence"
+ 
+ 
+ APPLICANT_DOCUMENT_CATEGORIES = frozenset(
+diff --git a/app/schemas/agent.py b/app/schemas/agent.py
+new file mode 100644
+index 0000000..6d0357d
+--- /dev/null
++++ b/app/schemas/agent.py
+@@ -0,0 +1,90 @@
++"""Recruitment agent register: what may be written, and the rules it must meet (BRD FR-90 to FR-94)."""
++
++from __future__ import annotations
++
++from datetime import date
++from decimal import Decimal
++from typing import Literal
++
++from pydantic import Field, ValidationInfo, field_validator
++
++from app.schemas.common import StrictModel, check_country, err, normalise_email
++
++AgentStatus = Literal["active", "under_review", "suspended", "deactivated"]
++EvidenceKind = Literal["agreement", "due_diligence"]
++
++
++class _AgentFields(StrictModel):
++    contact_name: str | None = Field(default=None, max_length=200)
++    contact_email: str | None = None
++    contact_phone: str | None = Field(default=None, max_length=40)
++    due_diligence_date: date | None = None
++    next_review_date: date | None = None
++    refusal_rate_threshold_pct: Decimal | None = Field(default=None, ge=0, le=100, decimal_places=1)
++
++    @field_validator("contact_email")
++    @classmethod
++    def _email(cls, v: str | None) -> str | None:
++        return normalise_email(v)
++
++    @field_validator("contact_phone")
++    @classmethod
++    def _phone(cls, v: str | None) -> str | None:
++        if v is not None and not all(ch.isdigit() or ch in "+ ()-" for ch in v):
++            raise err("ERR_INVALID_FORMAT", "Use digits, spaces, brackets, + and - only.")
++        return v
++
++    @field_validator("due_diligence_date")
++    @classmethod
++    def _dd_not_future(cls, v: date | None) -> date | None:
++        if v is not None and v > date.today():
++            raise err("ERR_INVALID_DATE", "The due-diligence date cannot be in the future.")
++        return v
++
++    @field_validator("next_review_date")
++    @classmethod
++    def _review_after_dd(cls, v: date | None, info: ValidationInfo) -> date | None:
++        # Both dates in the same request. An update that sends one of them is checked against the
++        # stored other one in the service.
++        check_review_order(info.data.get("due_diligence_date"), v)
++        return v
++
++
++class AgentCreateIn(_AgentFields):
++    name: str = Field(min_length=2, max_length=200)
++    country: str
++
++    @field_validator("country")
++    @classmethod
++    def _country(cls, v: str) -> str:
++        return check_country(v)  # type: ignore[return-value]
++
++
++class AgentUpdateIn(_AgentFields):
++    """Every field optional; only the fields sent are changed. Status has its own endpoint, because
++    suspending an agent is a decision with a reason, not an edit."""
++
++    name: str | None = Field(default=None, min_length=2, max_length=200)
++    country: str | None = None
++
++    @field_validator("country")
++    @classmethod
++    def _country(cls, v: str | None) -> str | None:
++        return check_country(v)
++
++
++class AgentStatusIn(StrictModel):
++    status: AgentStatus
++    reason: str | None = Field(default=None, max_length=1000, validate_default=True)
++
++    @field_validator("reason")
++    @classmethod
++    def _reason_when_restricting(cls, v: str | None, info: ValidationInfo) -> str | None:
++        if info.data.get("status", "active") != "active" and (v is None or len(v) < 10):
++            raise err("ERR_REASON_REQUIRED", "Give a reason of at least 10 characters. It is shown on the register.")
++        return v
++
++
++def check_review_order(dd: date | None, review: date | None) -> None:
++    if dd is not None and review is not None and review <= dd:
++        raise err("ERR_INVALID_DATE", "The next review must fall after the due-diligence date.")
+diff --git a/app/services/agents.py b/app/services/agents.py
+new file mode 100644
+index 0000000..6c0d4e6
+--- /dev/null
++++ b/app/services/agents.py
+@@ -0,0 +1,314 @@
++"""Recruitment agent register: adding, correcting, suspending, and the evidence held (BRD FR-90 to FR-94).
++
++Every change is audited in the same transaction as the change itself, with the old and the new value,
++because "who suspended this agent, when and why" is exactly what a compliance visit asks and the
++register only shows the current state.
++
++Status is separate from editing. Suspending or deactivating an agent is a decision with a reason; it
++stops the agent being attributed new applications (FR-94, enforced where applications are saved and
++submitted) but never removes the agent or its history.
++
++Evidence — the signed agreement and the due-diligence record (FR-91) — goes through the same checks
++as any other upload: size, file type by content, and the malware scan before anything is stored. A new
++file supersedes the previous one rather than replacing it, so the earlier evidence remains on file.
++"""
++
++from __future__ import annotations
++
++import logging
++import uuid
++from collections.abc import Iterator
++from datetime import date
++
++from sqlalchemy import func, select
++from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import Session
++
++from app.errors import BadRequest, Conflict, Forbidden, GuardFailed, NotFound, ServiceUnavailable
++from app.models.agent import Agent
++from app.models.application import Document
++from app.models.enums import DocumentCategory, ScanStatus, UserRole
++from app.models.user import User
++from app.schemas.agent import AgentCreateIn, AgentUpdateIn
++from app.services import audit
++from app.services.documents import safe_filename, sniff
++from app.services.scanning import ScannerUnavailable, get_scanner
++from app.services.storage import get_storage
++
++log = logging.getLogger("ese.agents")
++
++Opened = tuple[Document, Iterator[bytes]]
++
++#: Read the register (LLD 6). Finance has no part in agents.
++VIEW_ROLES = frozenset({UserRole.ADMISSIONS, UserRole.COMPLIANCE, UserRole.SENIOR, UserRole.ADMIN})
++#: Change the register. Agent oversight is a compliance duty; admissions reads it and uses it.
++EDIT_ROLES = frozenset({UserRole.COMPLIANCE, UserRole.SENIOR, UserRole.ADMIN})
++
++EVIDENCE: dict[str, tuple[DocumentCategory, str, str]] = {
++    # kind: (category, Agent column, label)
++    "agreement": (DocumentCategory.AGENT_AGREEMENT, "agreement_document_id", "agreement"),
++    "due_diligence": (DocumentCategory.AGENT_DUE_DILIGENCE, "due_diligence_document_id", "due-diligence record"),
++}
++
++#: The moves the register allows. Anything restricted can go back to active; a deactivated agent
++#: (one ESE has stopped working with) comes back only by reactivation, not straight into review.
++TRANSITIONS: dict[str, frozenset[str]] = {
++    "active": frozenset({"under_review", "suspended", "deactivated"}),
++    "under_review": frozenset({"active", "suspended", "deactivated"}),
++    "suspended": frozenset({"active", "deactivated"}),
++    "deactivated": frozenset({"active"}),
++}
++MIN_REASON = 10
++
++_FIELDS = ("name", "country", "contact_name", "contact_email", "contact_phone",
++           "due_diligence_date", "next_review_date", "refusal_rate_threshold_pct")  # fmt: skip
++
++
++def _require_edit(actor: User) -> None:
++    # Re-asserted here as well as on the route (FR-122): the service is the rule, the route a guard.
++    if actor.role not in EDIT_ROLES:
++        raise Forbidden(
++            message="Only compliance, the Authorising Officer or an administrator can change the agent register."
++        )
++
++
++def get(db: Session, agent_id: int, *, lock: bool = False) -> Agent:
++    stmt = select(Agent).where(Agent.id == agent_id)
++    if lock:
++        stmt = stmt.with_for_update()
++    agent = db.scalars(stmt).first()
++    if agent is None:
++        raise NotFound(message="No such agent.")
++    return agent
++
++
++_EXISTS = "An agent with this name is already on the register for that country."
++
++
++def _exists_error() -> BadRequest:
++    return BadRequest("ERR_AGENT_EXISTS", _EXISTS,
++                      details=[{"field": "name", "code": "ERR_AGENT_EXISTS", "message": _EXISTS}])  # fmt: skip
++
++
++def _duplicate(db: Session, name: str, country: str, exclude_id: int | None = None) -> None:
++    stmt = select(Agent.id).where(func.lower(Agent.name) == name.lower(), Agent.country == country)
++    if exclude_id is not None:
++        stmt = stmt.where(Agent.id != exclude_id)
++    if db.scalars(stmt).first() is not None:
++        raise _exists_error()
++
++
++def _flush_unique(db: Session, obj: object | None = None) -> None:
++    """Flush in a savepoint so that two simultaneous requests losing the race on the unique index
++    get the same answer as the up-front check, rather than a 500."""
++    try:
++        with db.begin_nested():
++            if obj is not None:
++                db.add(obj)
++            db.flush()
++    except IntegrityError as exc:
++        if "ux_agents_name_country" in str(exc.orig):
++            raise _exists_error() from exc
++        raise
++
++
++def _show(value: object) -> str:
++    return "—" if value is None or value == "" else str(value)
++
++
++def create(db: Session, actor: User, body: AgentCreateIn, ip: str | None) -> Agent:
++    _require_edit(actor)
++    _duplicate(db, body.name, body.country)
++    agent = Agent(**{f: getattr(body, f) for f in _FIELDS}, status="active")
++    _flush_unique(db, agent)
++    audit.write(db, actor, "agent.create", entity_type="agent", entity_id=agent.id,
++                detail=f"Added agent {agent.name} ({agent.country})", ip=ip)  # fmt: skip
++    return agent
++
++
++def update(db: Session, actor: User, agent_id: int, body: AgentUpdateIn, ip: str | None) -> Agent:
++    _require_edit(actor)
++    agent = get(db, agent_id, lock=True)
++    sent = body.model_dump(exclude_unset=True)
++    for required in ("name", "country"):
++        if required in sent and sent[required] is None:
++            raise BadRequest("ERR_REQUIRED", "This cannot be left blank.",
++                             details=[{"field": required, "code": "ERR_REQUIRED",
++                                       "message": "This cannot be left blank."}])  # fmt: skip
++
++    dd = sent.get("due_diligence_date", agent.due_diligence_date)
++    review = sent.get("next_review_date", agent.next_review_date)
++    if dd is not None and review is not None and review <= dd:
++        # 422, like the same rule when both dates arrive in one request (schemas/agent.py).
++        raise BadRequest("ERR_INVALID_DATE", "The next review must fall after the due-diligence date.", status_code=422,
++                         details=[{"field": "next_review_date", "code": "ERR_INVALID_DATE",
++                                   "message": "The next review must fall after the due-diligence date."}])  # fmt: skip
++
++    name, country = sent.get("name", agent.name), sent.get("country", agent.country)
++    if "name" in sent or "country" in sent:
++        _duplicate(db, name, country, exclude_id=agent.id)
++
++    changes = []
++    for field, new in sent.items():
++        old = getattr(agent, field)
++        if old != new:
++            changes.append(f"{field}: {_show(old)} -> {_show(new)}")
++            setattr(agent, field, new)
++    if not changes:
++        return agent
++    if "name" in sent or "country" in sent:
++        _flush_unique(db)
++    audit.write(db, actor, "agent.update", entity_type="agent", entity_id=agent.id,
++                detail=f"{agent.name}: " + "; ".join(changes), ip=ip)  # fmt: skip
++    return agent
++
++
++def set_status(db: Session, actor: User, agent_id: int, status: str, reason: str | None, ip: str | None) -> Agent:
++    _require_edit(actor)
++    agent = get(db, agent_id, lock=True)
++    if agent.status == status:
++        raise Conflict("ERR_INVALID_STATE", f"This agent is already {status.replace('_', ' ')}.")
++    if status not in TRANSITIONS.get(agent.status, frozenset()):
++        raise Conflict("ERR_INVALID_STATE",
++                       f"A {agent.status.replace('_', ' ')} agent cannot be moved straight to "
++                       f"{status.replace('_', ' ')}.")  # fmt: skip
++    reason = (reason or "").strip() or None
++    if status != "active" and (reason is None or len(reason) < MIN_REASON):
++        # Also enforced by the request schema; restated here because the service is the rule.
++        raise BadRequest("ERR_REASON_REQUIRED", "Give a reason of at least 10 characters.", status_code=422,
++                         details=[{"field": "reason", "code": "ERR_REASON_REQUIRED",
++                                   "message": "Give a reason of at least 10 characters."}])  # fmt: skip
++    old = agent.status
++    agent.status = status
++    agent.status_reason = None if status == "active" else reason
++    audit.write(db, actor, "agent.status_change", entity_type="agent", entity_id=agent.id,
++                detail=f"{agent.name}: status {old} -> {status}" + (f". Reason: {reason}" if reason else ""),
++                ip=ip)  # fmt: skip
++    return agent
++
++
++def evidence_documents(db: Session, agent: Agent) -> dict[str, Document | None]:
++    out: dict[str, Document | None] = {}
++    for kind, (_category, column, _label) in EVIDENCE.items():
++        doc_id = getattr(agent, column)
++        out[kind] = db.get(Document, doc_id) if doc_id else None
++    return out
++
++
++def upload_evidence(
++    db: Session, actor: User, agent_id: int, *, kind: str, filename: str | None, data: bytes, max_bytes: int,
++    ip: str | None = None,
++) -> Document:
++    """Store the agreement or due-diligence record. The caller commits on GuardFailed as well, so a
++    quarantined upload leaves its row and audit entries behind as evidence (FR-22)."""
++    _require_edit(actor)
++    if kind not in EVIDENCE:
++        raise BadRequest("ERR_INVALID_FORMAT", "Choose the agreement or the due-diligence record.")
++    category, column, label = EVIDENCE[kind]
++    agent = get(db, agent_id, lock=True)
++
++    if len(data) > max_bytes:
++        raise BadRequest("ERR_FILE_SIZE", f"Files must be {max_bytes // (1024 * 1024)}MB or smaller.",
++                         details=[{"field": "file", "code": "ERR_FILE_SIZE"}])  # fmt: skip
++    if not data:
++        raise BadRequest("ERR_FILE_TYPE", "The file is empty.", details=[{"field": "file", "code": "ERR_FILE_TYPE"}])
++    detected = sniff(data[:512])
++    if detected is None:
++        raise BadRequest("ERR_FILE_TYPE", "Upload a PDF, JPG or PNG file.",
++                         details=[{"field": "file", "code": "ERR_FILE_TYPE"}])  # fmt: skip
++    content_type, ext = detected
++
++    try:
++        result = get_scanner().scan(data)
++    except ScannerUnavailable as exc:
++        log.error("Malware scanner unavailable: %s", exc)
++        raise ServiceUnavailable(
++            "ERR_SCAN_UNAVAILABLE", "Documents cannot be accepted right now. Please try again shortly."
++        ) from exc
++
++    display_name = safe_filename(filename)
++    doc = Document(
++        agent_id=agent.id,
++        category=category,
++        filename=display_name,
++        storage_key=f"agents/{agent.id}/{category.value}/{uuid.uuid4().hex}{ext}",
++        content_type=content_type,
++        size_bytes=len(data),
++        scan_status=ScanStatus.CLEAN.value if result.clean else ScanStatus.QUARANTINED.value,
++        uploaded_by=actor.id,
++    )
++    db.add(doc)
++    db.flush()
++    audit.write(db, actor, "document.upload", entity_type="document", entity_id=doc.id,
++                detail=f"Agent {agent.name} ({agent.id}) {label}: {display_name} ({content_type}, {len(data)} bytes)",
++                ip=ip)  # fmt: skip
++
++    if not result.clean:
++        audit.write(db, None, "document.quarantine", entity_type="document", entity_id=doc.id,
++                    detail=f"Malware scan failed ({result.signature}); file not stored", ip=ip)  # fmt: skip
++        log.error("SECURITY: quarantined agent upload doc=%s agent=%s signature=%s", doc.id, agent.id, result.signature)
++        raise GuardFailed("ERR_SCAN_FAILED", "This file failed the security scan and has not been accepted.",
++                          details=[{"field": "file", "code": "ERR_SCAN_FAILED"}])  # fmt: skip
++
++    get_storage().put(doc.storage_key, data, content_type)
++
++    previous_id = getattr(agent, column)
++    previous = db.get(Document, previous_id) if previous_id else None
++    if previous is not None and previous.superseded_by is None:
++        previous.superseded_by = doc.id
++        audit.write(db, actor, "document.supersede", entity_type="document", entity_id=previous.id,
++                    detail=f"Agent {agent.name} {label} {previous.filename} superseded by {display_name}",
++                    ip=ip)  # fmt: skip
++    setattr(agent, column, doc.id)
++    # On the agent's own trail too, so "what changed on this agent" includes its evidence.
++    audit.write(db, actor, "agent.update", entity_type="agent", entity_id=agent.id,
++                detail=f"{agent.name}: {label}: {previous.filename if previous else '—'} -> {display_name} "
++                       f"(document {doc.id})",
++                ip=ip)  # fmt: skip
++    return doc
++
++
++def history(db: Session, agent: Agent) -> list[Document]:
++    """Every file ever uploaded against this agent, newest first, superseded and quarantined included."""
++    return list(db.scalars(select(Document).where(Document.agent_id == agent.id).order_by(Document.id.desc())))
++
++
++def _open(db: Session, actor: User, agent: Agent, doc: Document | None, ip: str | None) -> Opened:
++    if doc is None or doc.agent_id != agent.id:
++        raise NotFound(message="No such file is held for this agent.")
++    if doc.scan_status != ScanStatus.CLEAN:
++        raise Conflict("ERR_INVALID_STATE", "This document is not available for download.")
++    label = next((lbl for cat, _col, lbl in EVIDENCE.values() if cat == doc.category), str(doc.category))
++    audit.write(db, actor, "document.view", entity_type="document", entity_id=doc.id,
++                detail=f"Downloaded agent {agent.name} {label}: {doc.filename}"
++                       + (" (superseded)" if doc.superseded_by else ""), ip=ip)  # fmt: skip
++    return doc, get_storage().open(doc.storage_key)
++
++
++def open_evidence(db: Session, actor: User, agent_id: int, kind: str, ip: str | None) -> Opened:
++    """The current agreement or due-diligence record."""
++    if actor.role not in VIEW_ROLES:
++        raise Forbidden()
++    if kind not in EVIDENCE:
++        raise NotFound()
++    agent = get(db, agent_id)
++    return _open(db, actor, agent, evidence_documents(db, agent)[kind], ip)
++
++
++def open_document(db: Session, actor: User, agent_id: int, document_id: int, ip: str | None) -> Opened:
++    """Any file held against the agent, including superseded ones, so earlier evidence stays readable."""
++    if actor.role not in VIEW_ROLES:
++        raise Forbidden()
++    agent = get(db, agent_id)
++    return _open(db, actor, agent, db.get(Document, document_id), ip)
++
++
++def reviews_due(db: Session, horizon: date) -> list[Agent]:
++    """Agents still able to take applications whose next review has passed or falls by horizon."""
++    return list(db.scalars(
++        select(Agent).where(
++            Agent.status.in_(("active", "under_review")),
++            Agent.next_review_date.isnot(None),
++            Agent.next_review_date <= horizon,
++        ).order_by(Agent.next_review_date)
++    ))  # fmt: skip
+diff --git a/app/services/audit.py b/app/services/audit.py
+index 2243027..6266484 100644
+--- a/app/services/audit.py
++++ b/app/services/audit.py
+@@ -60,6 +60,8 @@ PROPOSED_ACTIONS: frozenset[str] = frozenset(
+         "auth.logout",  # explicit sign-out revokes the token
+         "admin.user_reactivate",  # reversal of admin.user_deactivate
+         "compliance.second_line",  # FR-52 second-line review, distinct from an ordinary save
++        # BRD FR-90 to FR-94: the agent register is changed in the system, so the changes are audited
++        "agent.create", "agent.update", "agent.status_change",
+     }
+ )
+ 
+diff --git a/app/services/documents.py b/app/services/documents.py
+index e476ea6..80ece9b 100644
+--- a/app/services/documents.py
++++ b/app/services/documents.py
+@@ -42,6 +42,8 @@ SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
+ 
+ DOWNLOAD_ROLES = frozenset({UserRole.ADMISSIONS, UserRole.COMPLIANCE, UserRole.SENIOR, UserRole.ADMIN})
+ UPLOAD_STAFF_ROLES = DOWNLOAD_ROLES  # LLD 6: document upload — not finance
++#: Held against an agent (BRD FR-91), never against an application or a student.
++AGENT_DOCUMENT_CATEGORIES = frozenset({DocumentCategory.AGENT_AGREEMENT, DocumentCategory.AGENT_DUE_DILIGENCE})
+ 
+ 
+ def sniff(head: bytes) -> tuple[str, str] | None:
+@@ -79,6 +81,10 @@ def upload(
+         raise Forbidden()
+     if app.status in TERMINAL_STATUSES:
+         raise Conflict("ERR_INVALID_STATE", "Documents cannot be added to a closed application.")
++    if category in AGENT_DOCUMENT_CATEGORIES:
++        raise BadRequest("ERR_INVALID_FORMAT",
++                         "Agent agreements and due-diligence records are held on the agent register.",
++                         details=[{"field": "category", "code": "ERR_INVALID_FORMAT"}])  # fmt: skip
+ 
+     # Steps 1-2: size and magic bytes
+     if len(data) > max_bytes:
+diff --git a/app/services/notifications.py b/app/services/notifications.py
+index 6e5509b..de0b518 100644
+--- a/app/services/notifications.py
++++ b/app/services/notifications.py
+@@ -115,6 +115,13 @@ COMPLIANCE_ALERT_TEMPLATES: dict[str, tuple[str, str]] = {
+         "The permission recorded for student record $student_id expires on $expires.\n\n"
+         "Check whether an extension or a new application is in progress.",
+     ),
++    "agent.review_due": (
++        "Agent review $when — $agent",
++        "The periodic review of recruitment agent $agent ($country) is due on $review_date.\n\n"
++        "Check the agreement and due-diligence record are current and the agent's refusal rate is within "
++        "its threshold, then record the new due-diligence and next review dates on the agent register:\n\n"
++        "$link",
++    ),
+     "document.expiring": (
+         "Document expiring — $category",
+         "Document $document_id ($category) expires on $expires.\n\nRequest a replacement before it "
+diff --git a/app/workers/jobs/compliance.py b/app/workers/jobs/compliance.py
+index 2b35b67..0056e70 100644
+--- a/app/workers/jobs/compliance.py
++++ b/app/workers/jobs/compliance.py
+@@ -25,7 +25,7 @@ from app.models.enums import EnrolmentStatus, EventType
+ from app.models.offer import Offer
+ from app.models.operations import JOB_FAILED, JOB_SUCCESS, JobRun
+ from app.models.student import StudentRecord
+-from app.services import events, notifications, students
++from app.services import agents, events, notifications, students
+ from app.services.settings import get_setting
+ 
+ log = logging.getLogger("ese.worker.jobs")
+@@ -265,6 +265,30 @@ def expiry_alerts(db: Session, today: date | None = None) -> int:
+     return sent
+ 
+ 
++def agent_review_reminder(db: Session, today: date | None = None) -> int:
++    """Agent reviews coming due, and overdue ones (BRD FR-91).
++
++    One alert when the review enters the notice window, and one more if the date passes without a
++    new review being recorded. Recording the review moves next_review_date, which changes the
++    dedupe key, so the next cycle alerts afresh. Suspended and deactivated agents take no
++    applications and are not chased.
++    """
++    today = today or date.today()
++    notice_days = int(get_setting(db, "AGENT_REVIEW_ALERT_DAYS", 30))
++    sent = 0
++    for agent in agents.reviews_due(db, today + timedelta(days=notice_days)):
++        overdue = agent.next_review_date < today
++        stage = "overdue" if overdue else "due"
++        if notifications.enqueue(
++            db, "agent.review_due", notifications.compliance_inbox(db),
++            {"agent": agent.name, "country": agent.country, "review_date": agent.next_review_date.isoformat(),
++             "when": "overdue" if overdue else "due", "link": notifications.link(f"/staff/agents/{agent.id}")},
++            dedupe_key=f"agent-review:{agent.id}:{agent.next_review_date.isoformat()}:{stage}",
++        ):
++            sent += 1
++    return sent
++
++
+ def export_cleanup(db: Session, today: date | None = None) -> int:
+     """Delete expired export results (LLD 13.1).
+ 
+@@ -327,4 +351,5 @@ JOBS: dict[str, Callable[[Session], int]] = {
+     "export_cleanup": export_cleanup,
+     "calendar_headroom_check": calendar_headroom_check,
+     "notification_dispatch": notification_dispatch,
++    "agent_review_reminder": agent_review_reminder,
+ }
+diff --git a/app/workers/scheduler.py b/app/workers/scheduler.py
+index 5553e8f..9022ccf 100644
+--- a/app/workers/scheduler.py
++++ b/app/workers/scheduler.py
+@@ -5,8 +5,8 @@ it, because an event that was never reported and a job that silently stopped run
+ from outside unless the runs are recorded.
+ 
+ Registered: deadline_sweep, non_enrolment_detection, engagement_check, expiry_alerts,
+-export_cleanup, calendar_headroom_check and notification_dispatch. Still to come (Sprint 4):
+-metric_refresh, agent_review_reminder, retention_sweep.
++export_cleanup, calendar_headroom_check, notification_dispatch and agent_review_reminder. Still to
++come: metric_refresh, retention_sweep.
+ 
+     python -m app.workers.scheduler
+ """
+@@ -50,6 +50,7 @@ SCHEDULE: dict[str, dict] = {
+     "export_cleanup": {"trigger": "cron", "hour": 1, "minute": 30},
+     "calendar_headroom_check": {"trigger": "cron", "day_of_week": "mon", "hour": 8, "minute": 15},
+     "notification_dispatch": {"trigger": "interval", "minutes": 5},
++    "agent_review_reminder": {"trigger": "cron", "hour": 6, "minute": 20},
+ }
+ 
+ 
+diff --git a/migrations/versions/0008_agent_management.py b/migrations/versions/0008_agent_management.py
+new file mode 100644
+index 0000000..d9f1379
+--- /dev/null
++++ b/migrations/versions/0008_agent_management.py
+@@ -0,0 +1,81 @@
++"""Agent management: evidence held against an agent, and the reason for its status.
++
++Revision ID: 0008_agent_management
++Revises: 0007_engagement_episode
++Create Date: 2026-09-30
++
++BRD FR-90 to FR-94. The agents table has carried agreement_document_id and due_diligence_document_id
++since the baseline, but a document could only belong to an application or a student, so there was
++nothing those columns could point at. Documents may now belong to an agent instead, under two new
++categories kept apart from the applicant ones.
++
++status_reason records why an agent was suspended, put under review or deactivated. The audit trail
++has the full history; this column is what the register shows today, so nobody has to go to the
++trail to learn why an agent cannot be selected. updated_at is kept by the same trigger function the
++applications table uses.
++
++Forward-only (LLD 19.1).
++"""
++
++from __future__ import annotations
++
++import sqlalchemy as sa
++from alembic import op
++
++revision = "0008_agent_management"
++down_revision = "0007_engagement_episode"
++branch_labels = None
++depends_on = None
++
++#: Settings this migration adds. The test suite re-seeds from here after each test.
++SETTINGS = [("AGENT_REVIEW_ALERT_DAYS", "30", "int")]
++
++
++def upgrade() -> None:
++    op.execute("ALTER TYPE document_category ADD VALUE IF NOT EXISTS 'agent_agreement'")
++    op.execute("ALTER TYPE document_category ADD VALUE IF NOT EXISTS 'agent_due_diligence'")
++
++    op.execute("ALTER TABLE documents ADD COLUMN agent_id bigint NULL REFERENCES agents(id) ON DELETE RESTRICT")
++    op.execute("CREATE INDEX ix_documents_agent ON documents (agent_id) WHERE agent_id IS NOT NULL")
++    op.execute("ALTER TABLE documents DROP CONSTRAINT ck_documents_owner")
++    op.execute(
++        "ALTER TABLE documents ADD CONSTRAINT ck_documents_owner "
++        "CHECK (application_id IS NOT NULL OR student_id IS NOT NULL OR agent_id IS NOT NULL)"
++    )
++
++    op.execute("ALTER TABLE agents ADD COLUMN status_reason text NULL")
++    op.execute("ALTER TABLE agents ADD COLUMN updated_at timestamptz NOT NULL DEFAULT now()")
++    op.execute(
++        "CREATE TRIGGER trg_agents_updated_at BEFORE UPDATE ON agents "
++        "FOR EACH ROW EXECUTE FUNCTION set_updated_at()"
++    )
++    op.execute(
++        "COMMENT ON COLUMN agents.status_reason IS "
++        "'Why the agent is under review, suspended or deactivated (FR-94); history is in audit_entries'"
++    )
++    # One agent per trading name and country: the application form's picker shows name and country
++    # only, so two identical rows could not be told apart. Created only if existing data allows it;
++    # otherwise the service-level check still applies and the duplicates must be merged by hand.
++    op.execute(
++        """
++        DO $$
++        BEGIN
++            IF NOT EXISTS (SELECT 1 FROM agents GROUP BY lower(name), country HAVING count(*) > 1) THEN
++                CREATE UNIQUE INDEX ux_agents_name_country ON agents (lower(name), country);
++            ELSE
++                RAISE WARNING 'agents has duplicate name/country rows; ux_agents_name_country not created';
++            END IF;
++        END $$;
++        """
++    )
++    # How far ahead the agent_review_reminder job starts chasing a review (FR-91).
++    for key, value, value_type in SETTINGS:
++        op.execute(
++            sa.text(
++                "INSERT INTO system_settings (key, value, value_type) VALUES (:k, :v, :t) ON CONFLICT (key) DO NOTHING"
++            ).bindparams(k=key, v=value, t=value_type)
++        )
++
++
++def downgrade() -> None:
++    raise NotImplementedError("Migrations are forward-only (LLD 19.1).")
+diff --git a/tests/conftest.py b/tests/conftest.py
+index ce9b514..e74673f 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -79,7 +79,7 @@ def load_migration(name: str):
+     return module
+ 
+ 
+-SETTINGS_SEED = load_migration("0002_auth_operational").SETTINGS
++SETTINGS_SEED = load_migration("0002_auth_operational").SETTINGS + load_migration("0008_agent_management").SETTINGS
+ BANK_HOLIDAYS = load_migration("0004_post_cas_compliance").BANK_HOLIDAYS
+ 
+ 
+diff --git a/tests/integration/test_agent_management.py b/tests/integration/test_agent_management.py
+new file mode 100644
+index 0000000..8457f97
+--- /dev/null
++++ b/tests/integration/test_agent_management.py
+@@ -0,0 +1,429 @@
++"""Maintaining the recruitment agent register (BRD FR-90 to FR-94).
++
++What a compliance visit would test: that only the right people can change the register; that every
++change, with its old value and its reason, is in the audit trail; that suspending an agent stops new
++attribution without erasing the agent; that evidence is scanned before it is kept and superseded
++rather than overwritten; and that a review coming due is chased once, not every morning.
++"""
++
++from __future__ import annotations
++
++from datetime import date, timedelta
++
++import pytest
++from sqlalchemy import text
++from sqlalchemy.engine import Engine
++from sqlalchemy.orm import Session
++
++from app.services.storage import get_storage
++from app.workers.jobs.compliance import agent_review_reminder
++from tests.fixtures import API, EICAR, PDF_BYTES, PNG_BYTES, complete_data
++
++
++@pytest.fixture
++def team(staff):
++    return {"admissions": staff("admissions"), "compliance": staff("compliance"),
++            "finance": staff("finance"), "senior": staff("senior"), "admin": staff("admin")}  # fmt: skip
++
++
++@pytest.fixture
++def session(owner_engine: Engine) -> Session:
++    from app.database import get_sessionmaker
++
++    db = get_sessionmaker()()
++    yield db
++    db.close()
++
++
++def agent_audit(owner_engine: Engine, agent_id: int) -> list[tuple[str, str]]:
++    with owner_engine.connect() as conn:
++        return [tuple(r) for r in conn.execute(text(
++            "SELECT action, detail FROM audit_entries WHERE entity_type = 'agent' AND entity_id = :a ORDER BY at, id"
++        ), {"a": agent_id})]  # fmt: skip
++
++
++def new_agent(client, actor, **extra) -> dict:
++    body = {"name": "Global Pathways Ltd", "country": "gh", "contact_name": "Ama Mensah",
++            "contact_email": "Ama@GlobalPathways.example", **extra}  # fmt: skip
++    res = client.post(f"{API}/agents", json=body, headers=actor.headers)
++    assert res.status_code == 201, res.text
++    return res.json()
++
++
++# --- FR-90: add and correct ---------------------------------------------------------------------
++def test_compliance_adds_an_agent_and_it_is_audited(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"], contact_phone="+233 20 123 4567",
++                      due_diligence_date="2026-01-15", next_review_date="2027-01-15",
++                      refusal_rate_threshold_pct=10)  # fmt: skip
++    assert agent["status"] == "active"
++    assert agent["country_code"] == "GH" and agent["country"] == "Ghana"
++    assert agent["contact_email"] == "ama@globalpathways.example"
++    assert agent["refusal_rate_threshold_pct"] == 10.0
++    assert agent["evidence"] == {"agreement": None, "due_diligence": None}
++    assert agent_audit(owner_engine, agent["id"]) == [("agent.create", "Added agent Global Pathways Ltd (GH)")]
++
++    listed = {r["name"]: r for r in client.get(f"{API}/agents", headers=team["admissions"].headers).json()}
++    assert listed["Global Pathways Ltd"]["contact_name"] == "Ama Mensah"
++
++
++def test_new_agent_can_be_attributed_straight_away(client, reference, team, applicant, draft):
++    agent = new_agent(client, team["compliance"])
++    data = complete_data(reference, full_name="Priya Raman", email="priya@example.com", agent_id=agent["id"])
++    res = client.put(f"{API}/applications/{draft['id']}", json={"data": data}, headers=applicant.headers)
++    assert res.status_code == 200, res.text
++
++
++@pytest.mark.parametrize("role", ["admissions", "finance"])
++def test_only_compliance_senior_and_admin_change_the_register(client, reference, team, role):
++    res = client.post(f"{API}/agents", json={"name": "Nope Ltd", "country": "IN"}, headers=team[role].headers)
++    assert res.status_code == 403
++    res = client.patch(f"{API}/agents/{reference['agent_id']}", json={"contact_name": "X"}, headers=team[role].headers)
++    assert res.status_code == 403
++    res = client.post(f"{API}/agents/{reference['agent_id']}/status",
++                      json={"status": "suspended", "reason": "Because I can"}, headers=team[role].headers)  # fmt: skip
++    assert res.status_code == 403
++
++
++def test_senior_and_admin_can_change_the_register(client, reference, team):
++    assert client.post(f"{API}/agents", json={"name": "Senior Adds Ltd", "country": "IN"},
++                       headers=team["senior"].headers).status_code == 201  # fmt: skip
++    assert client.post(f"{API}/agents", json={"name": "Admin Adds Ltd", "country": "IN"},
++                       headers=team["admin"].headers).status_code == 201  # fmt: skip
++
++
++def test_applicant_cannot_read_an_agent(client, reference, applicant):
++    assert client.get(f"{API}/agents/{reference['agent_id']}", headers=applicant.headers).status_code == 403
++
++
++def test_duplicate_name_in_the_same_country_is_refused(client, reference, team):
++    new_agent(client, team["compliance"])
++    res = client.post(f"{API}/agents", json={"name": "global pathways ltd", "country": "GH"},
++                      headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 400 and res.json()["error"]["code"] == "ERR_AGENT_EXISTS"
++    # The same trading name in another country is a different agent.
++    assert client.post(f"{API}/agents", json={"name": "Global Pathways Ltd", "country": "NG"},
++                       headers=team["compliance"].headers).status_code == 201  # fmt: skip
++
++
++def test_invalid_input_is_refused_field_by_field(client, reference, team):
++    res = client.post(f"{API}/agents", json={"name": "A", "country": "XX", "contact_email": "not-an-email",
++                                             "next_review_date": "2020-01-01", "due_diligence_date": "2021-01-01"},
++                      headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 422
++    fields = {d["field"] for d in res.json()["error"]["details"]}
++    assert {"name", "country", "contact_email", "next_review_date"} <= fields
++
++
++def test_edit_records_old_and_new_values(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    res = client.patch(f"{API}/agents/{agent['id']}",
++                       json={"contact_name": "Kofi Boateng", "next_review_date": "2027-03-01"},
++                       headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 200, res.text
++    assert res.json()["contact_name"] == "Kofi Boateng"
++    action, detail = agent_audit(owner_engine, agent["id"])[-1]
++    assert action == "agent.update"
++    assert "contact_name: Ama Mensah -> Kofi Boateng" in detail
++    assert "next_review_date: — -> 2027-03-01" in detail
++
++
++def test_an_edit_that_changes_nothing_writes_no_audit(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    client.patch(f"{API}/agents/{agent['id']}", json={"contact_name": "Ama Mensah"}, headers=team["compliance"].headers)
++    assert [a for a, _ in agent_audit(owner_engine, agent["id"])] == ["agent.create"]
++
++
++def test_edit_checks_review_date_against_the_stored_due_diligence_date(client, reference, team):
++    agent = new_agent(client, team["compliance"], due_diligence_date="2026-06-01")
++    res = client.patch(f"{API}/agents/{agent['id']}", json={"next_review_date": "2026-05-01"},
++                       headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 422  # same status as when both dates are sent together
++    assert res.json()["error"]["details"][0]["field"] == "next_review_date"
++
++
++def test_name_cannot_be_cleared(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    res = client.patch(f"{API}/agents/{agent['id']}", json={"name": None}, headers=team["compliance"].headers)
++    assert res.status_code == 400
++
++
++def test_status_is_not_changed_by_an_edit(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    res = client.patch(f"{API}/agents/{agent['id']}", json={"status": "suspended"}, headers=team["compliance"].headers)
++    assert res.status_code == 422  # unknown field: status has its own endpoint, with a reason
++
++
++# --- FR-94: suspend, deactivate, reactivate -----------------------------------------------------------
++def test_suspending_needs_a_reason(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    res = client.post(f"{API}/agents/{agent['id']}/status", json={"status": "suspended"},
++                      headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 422
++    assert res.json()["error"]["details"][0]["field"] == "reason"
++
++
++def test_suspended_agent_stays_listed_and_cannot_be_attributed(
++    client, reference, team, applicant, draft, owner_engine
++):
++    agent = new_agent(client, team["compliance"])
++    res = client.post(f"{API}/agents/{agent['id']}/status",
++                      json={"status": "suspended", "reason": "Refusal rate above threshold pending review"},
++                      headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 200, res.text
++    assert res.json()["status"] == "suspended"
++    assert res.json()["status_reason"] == "Refusal rate above threshold pending review"
++
++    listed = {r["name"]: r for r in client.get(f"{API}/agents", headers=team["admissions"].headers).json()}
++    assert listed["Global Pathways Ltd"]["status"] == "suspended"
++    assert listed["Global Pathways Ltd"]["status_reason"].startswith("Refusal rate")
++
++    data = complete_data(reference, full_name="Priya Raman", email="priya@example.com", agent_id=agent["id"])
++    res = client.put(f"{API}/applications/{draft['id']}", json={"data": data}, headers=applicant.headers)
++    assert res.status_code in (400, 422)
++
++    action, detail = agent_audit(owner_engine, agent["id"])[-1]
++    assert action == "agent.status_change"
++    assert "active -> suspended" in detail and "Refusal rate above threshold" in detail
++
++
++def test_reactivating_clears_the_reason_and_is_audited(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    client.post(f"{API}/agents/{agent['id']}/status", json={"status": "deactivated", "reason": "Agreement ended 2026"},
++                headers=team["compliance"].headers)  # fmt: skip
++    res = client.post(f"{API}/agents/{agent['id']}/status", json={"status": "active"}, headers=team["senior"].headers)
++    assert res.status_code == 200
++    assert res.json()["status"] == "active" and res.json()["status_reason"] is None
++    assert [a for a, _ in agent_audit(owner_engine, agent["id"])][-2:] == ["agent.status_change", "agent.status_change"]
++
++
++def test_a_deactivated_agent_comes_back_only_by_reactivation(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    client.post(f"{API}/agents/{agent['id']}/status", json={"status": "deactivated", "reason": "Agreement ended 2026"},
++                headers=team["compliance"].headers)  # fmt: skip
++    res = client.post(f"{API}/agents/{agent['id']}/status", json={"status": "under_review", "reason": "Looking again at it"},
++                      headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 409
++
++
++def test_service_requires_a_reason_even_without_the_schema(client, reference, team, session):
++    from app.errors import BadRequest
++    from app.models.user import User
++    from app.services import agents as svc
++
++    agent = new_agent(client, team["compliance"])
++    actor = session.get(User, team["compliance"].id)
++    with pytest.raises(BadRequest):
++        svc.set_status(session, actor, agent["id"], "suspended", "  short ", None)
++    session.rollback()
++
++
++def test_last_changed_moves_on_every_change(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    edited = client.patch(f"{API}/agents/{agent['id']}", json={"contact_name": "Kofi"}, headers=team["compliance"].headers).json()
++    assert edited["updated_at"] > agent["updated_at"]
++    suspended = client.post(f"{API}/agents/{agent['id']}/status", json={"status": "suspended", "reason": "Pending a check"},
++                            headers=team["compliance"].headers).json()  # fmt: skip
++    assert suspended["updated_at"] > edited["updated_at"]
++
++
++def test_bad_threshold_is_refused_not_cleared(client, reference, team):
++    agent = new_agent(client, team["compliance"], refusal_rate_threshold_pct=10)
++    res = client.patch(f"{API}/agents/{agent['id']}", json={"refusal_rate_threshold_pct": "10%"},
++                       headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 422
++    assert client.get(f"{API}/agents/{agent['id']}", headers=team["compliance"].headers).json()["refusal_rate_threshold_pct"] == 10.0
++
++
++def test_setting_the_same_status_again_is_refused(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    res = client.post(f"{API}/agents/{agent['id']}/status", json={"status": "active"}, headers=team["compliance"].headers)
++    assert res.status_code == 409
++
++
++# --- FR-91: evidence -------------------------------------------------------------------------------
++def upload(client, actor, agent_id, kind, content=PDF_BYTES, name="agreement.pdf"):
++    return client.post(f"{API}/agents/{agent_id}/evidence", data={"kind": kind},
++                       files={"file": (name, content, "application/pdf")}, headers=actor.headers)  # fmt: skip
++
++
++def test_agreement_is_uploaded_and_downloaded_with_audit(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    res = upload(client, team["compliance"], agent["id"], "agreement")
++    assert res.status_code == 201, res.text
++    ev = res.json()["evidence"]["agreement"]
++    assert ev["filename"] == "agreement.pdf" and ev["available"] is True
++    assert res.json()["evidence"]["due_diligence"] is None
++
++    got = client.get(f"{API}/agents/{agent['id']}/evidence/agreement", headers=team["admissions"].headers)
++    assert got.status_code == 200 and got.content == PDF_BYTES
++    assert "no-store" in got.headers["cache-control"]
++    with owner_engine.connect() as conn:
++        actions = list(conn.execute(text(
++            "SELECT action FROM audit_entries WHERE entity_type = 'document' AND entity_id = :d ORDER BY at, id"
++        ), {"d": ev["id"]}).scalars())  # fmt: skip
++    assert actions == ["document.upload", "document.view"]
++
++
++def test_a_new_file_supersedes_the_old_one(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    first = upload(client, team["compliance"], agent["id"], "due_diligence", name="dd-2025.pdf").json()
++    second = upload(client, team["compliance"], agent["id"], "due_diligence", PNG_BYTES, "dd-2026.png").json()
++    old_id = first["evidence"]["due_diligence"]["id"]
++    new_id = second["evidence"]["due_diligence"]["id"]
++    assert new_id != old_id and second["evidence"]["due_diligence"]["filename"] == "dd-2026.png"
++    with owner_engine.connect() as conn:
++        assert conn.execute(text("SELECT superseded_by FROM documents WHERE id = :d"), {"d": old_id}).scalar() == new_id
++
++
++def test_infected_evidence_is_refused_and_kept_as_evidence(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    res = upload(client, team["compliance"], agent["id"], "agreement", b"%PDF-1.4\n" + EICAR, "eicar.pdf")
++    assert res.status_code == 422 and res.json()["error"]["code"] == "ERR_SCAN_FAILED"
++    detail = client.get(f"{API}/agents/{agent['id']}", headers=team["compliance"].headers).json()
++    assert detail["evidence"]["agreement"] is None  # the agent does not point at a quarantined file
++    with owner_engine.connect() as conn:
++        status, key = conn.execute(text(
++            "SELECT scan_status, storage_key FROM documents WHERE agent_id = :a"), {"a": agent["id"]}).one()  # fmt: skip
++    assert status == "quarantined"
++    assert not get_storage().exists(key)
++    with owner_engine.connect() as conn:
++        actions = list(conn.execute(text(
++            "SELECT action FROM audit_entries WHERE entity_type = 'document' ORDER BY at, id")).scalars())  # fmt: skip
++    assert actions == ["document.upload", "document.quarantine"]
++
++
++def test_wrong_file_type_and_wrong_kind_are_refused(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    assert upload(client, team["compliance"], agent["id"], "agreement", b"MZ\x90\x00", "tool.exe").status_code == 400
++    assert upload(client, team["compliance"], agent["id"], "passport").status_code == 422
++
++
++def test_admissions_reads_evidence_but_cannot_upload_it(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    assert upload(client, team["admissions"], agent["id"], "agreement").status_code == 403
++    assert client.get(f"{API}/agents/{agent['id']}/evidence/agreement",
++                      headers=team["admissions"].headers).status_code == 404  # nothing held yet  # fmt: skip
++    assert client.get(f"{API}/agents/{agent['id']}/evidence/agreement",
++                      headers=team["finance"].headers).status_code == 403  # fmt: skip
++
++
++def test_agent_documents_do_not_appear_on_application_screens(client, reference, team, applicant, draft):
++    """The application has a document of its own, so an empty list cannot pass by accident."""
++    res = client.post(f"{API}/applications/{draft['id']}/documents", data={"category": "passport"},
++                      files={"file": ("passport.pdf", PDF_BYTES, "application/pdf")}, headers=applicant.headers)  # fmt: skip
++    assert res.status_code == 201, res.text
++    agent = new_agent(client, team["compliance"])
++    assert upload(client, team["compliance"], agent["id"], "agreement").status_code == 201
++    record = client.get(f"{API}/applications/{draft['id']}", headers=team["compliance"].headers)
++    assert [d["category"] for d in record.json()["documents"]] == ["passport"]
++
++
++@pytest.mark.parametrize("category", ["agent_agreement", "agent_due_diligence"])
++def test_agent_categories_cannot_be_filed_on_an_application(client, reference, team, draft, category):
++    res = client.post(f"{API}/applications/{draft['id']}/documents", data={"category": category},
++                      files={"file": ("x.pdf", PDF_BYTES, "application/pdf")}, headers=team["compliance"].headers)  # fmt: skip
++    assert res.status_code == 400
++
++
++def test_evidence_route_refuses_an_oversized_body_before_reading_it(client, reference, team):
++    """The body-size guards key on the upload paths; this route must be one of them."""
++    agent = new_agent(client, team["compliance"])
++    res = client.post(f"{API}/agents/{agent['id']}/evidence", content=b"x",
++                      headers={**team["compliance"].headers, "Content-Length": str(50 * 1024 * 1024),
++                               "Content-Type": "multipart/form-data; boundary=x"})  # fmt: skip
++    assert res.status_code == 400 and res.json()["error"]["code"] == "ERR_FILE_SIZE"
++
++
++def test_evidence_over_the_file_limit_is_refused(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    big = b"%PDF-1.4\n" + b"0" * (6 * 1024 * 1024)
++    res = upload(client, team["compliance"], agent["id"], "agreement", big, "big.pdf")
++    assert res.status_code == 400 and res.json()["error"]["code"] == "ERR_FILE_SIZE"
++
++
++@pytest.mark.parametrize("role", ["finance"])
++def test_finance_cannot_upload_evidence(client, reference, team, role):
++    agent = new_agent(client, team["compliance"])
++    assert upload(client, team[role], agent["id"], "agreement").status_code == 403
++
++
++def test_applicant_cannot_upload_or_download_evidence(client, reference, team, applicant):
++    agent = new_agent(client, team["compliance"])
++    upload(client, team["compliance"], agent["id"], "agreement")
++    assert upload(client, applicant, agent["id"], "agreement").status_code == 403
++    assert client.get(f"{API}/agents/{agent['id']}/evidence/agreement", headers=applicant.headers).status_code == 403
++
++
++def test_upload_is_on_the_agents_own_trail(client, reference, team, owner_engine):
++    agent = new_agent(client, team["compliance"])
++    upload(client, team["compliance"], agent["id"], "agreement", name="v1.pdf")
++    upload(client, team["compliance"], agent["id"], "agreement", name="v2.pdf")
++    trail = agent_audit(owner_engine, agent["id"])
++    assert trail[-2][0] == "agent.update" and "agreement: — -> v1.pdf" in trail[-2][1]
++    assert trail[-1][0] == "agent.update" and "agreement: v1.pdf -> v2.pdf" in trail[-1][1]
++
++
++def test_superseded_evidence_stays_listed_and_downloadable(client, reference, team):
++    agent = new_agent(client, team["compliance"])
++    first = upload(client, team["compliance"], agent["id"], "agreement", name="v1.pdf").json()
++    detail = upload(client, team["compliance"], agent["id"], "agreement", PNG_BYTES, "v2.png").json()
++    history = {h["filename"]: h for h in detail["evidence_history"]}
++    assert history["v1.pdf"]["status"] == "superseded" and history["v2.png"]["status"] == "current"
++    old_id = first["evidence"]["agreement"]["id"]
++    got = client.get(f"{API}/agents/{agent['id']}/documents/{old_id}", headers=team["admissions"].headers)
++    assert got.status_code == 200 and got.content == PDF_BYTES
++
++
++def test_another_agents_document_cannot_be_read_through_this_agent(client, reference, team):
++    a = new_agent(client, team["compliance"])
++    b = client.post(f"{API}/agents", json={"name": "Other Ltd", "country": "IN"}, headers=team["compliance"].headers).json()
++    doc_id = upload(client, team["compliance"], a["id"], "agreement").json()["evidence"]["agreement"]["id"]
++    assert client.get(f"{API}/agents/{b['id']}/documents/{doc_id}", headers=team["compliance"].headers).status_code == 404
++
++
++# --- FR-91: review reminders -----------------------------------------------------------------------------
++def _queued(owner_engine: Engine) -> list[str]:
++    with owner_engine.connect() as conn:
++        return list(conn.execute(text(
++            "SELECT dedupe_key FROM notification_queue WHERE template_key = 'agent.review_due' ORDER BY id"
++        )).scalars())  # fmt: skip
++
++
++def test_review_reminder_fires_once_when_due_and_once_when_overdue(client, reference, team, session, owner_engine):
++    soon = date.today() + timedelta(days=10)
++    agent = new_agent(client, team["compliance"], next_review_date=soon.isoformat())
++    assert agent_review_reminder(session) == 1
++    session.commit()
++    assert agent_review_reminder(session) == 0  # second run the same day: nothing new
++    session.commit()
++    # The date passes with no review recorded: one more, marked overdue.
++    assert agent_review_reminder(session, today=soon + timedelta(days=1)) == 1
++    session.commit()
++    assert agent_review_reminder(session, today=soon + timedelta(days=2)) == 0
++    keys = _queued(owner_engine)
++    assert keys == [f"agent-review:{agent['id']}:{soon.isoformat()}:due",
++                    f"agent-review:{agent['id']}:{soon.isoformat()}:overdue"]  # fmt: skip
++
++
++def test_recording_the_review_starts_a_new_cycle(client, reference, team, session, owner_engine):
++    soon = date.today() + timedelta(days=5)
++    agent = new_agent(client, team["compliance"], next_review_date=soon.isoformat())
++    agent_review_reminder(session)
++    session.commit()
++    client.patch(f"{API}/agents/{agent['id']}", json={"due_diligence_date": date.today().isoformat(),
++                                                      "next_review_date": (soon + timedelta(days=365)).isoformat()},
++                 headers=team["compliance"].headers)  # fmt: skip
++    session.expire_all()
++    assert agent_review_reminder(session) == 0  # next review is a year away
++    # Eleven months on, the new date enters the notice window: a fresh alert, not a duplicate.
++    assert agent_review_reminder(session, today=soon + timedelta(days=345)) == 1
++
++
++def test_review_reminder_skips_suspended_agents_and_distant_reviews(client, reference, team, session):
++    far = new_agent(client, team["compliance"], next_review_date=(date.today() + timedelta(days=200)).isoformat())
++    near = client.post(f"{API}/agents", json={"name": "Near Ltd", "country": "IN",
++                                             "next_review_date": (date.today() + timedelta(days=3)).isoformat()},
++                       headers=team["compliance"].headers).json()  # fmt: skip
++    client.post(f"{API}/agents/{near['id']}/status", json={"status": "suspended", "reason": "Under investigation now"},
++                headers=team["compliance"].headers)  # fmt: skip
++    assert far["id"] and agent_review_reminder(session) == 0
+diff --git a/tests/unit/test_adapters.py b/tests/unit/test_adapters.py
+index 38e11b5..73bcc0f 100644
+--- a/tests/unit/test_adapters.py
++++ b/tests/unit/test_adapters.py
+@@ -120,7 +120,8 @@ def test_templates_render_without_missing_placeholders():
+                "cas_number": "E4G0ABC123", "course": "BSc", "start_date": "2027-01-18", "end_date": "2030-01-18",
+                "event": "deferral", "deadline": "2026-10-09", "student_id": 1, "percentage": 62.5,
+                "threshold": 80, "expires": "2026-12-01", "document_id": 4, "category": "passport",
+-               "offer_id": 9, "days": 45}  # fmt: skip
++               "offer_id": 9, "days": 45, "agent": "A", "country": "GH", "review_date": "2026-10-20",
++               "when": "due"}  # fmt: skip
+     for key in notifications.TEMPLATES:
+         subject, body = notifications.render(key, payload)
+         assert "$" not in subject + body, key
+diff --git a/web/src/api.ts b/web/src/api.ts
+index d7c5142..df7c7bc 100644
+--- a/web/src/api.ts
++++ b/web/src/api.ts
+@@ -591,7 +591,9 @@ export interface AgentRow {
+   id: number;
+   name: string;
+   country: string;
+-  status: string;
++  country_code: string;
++  status: AgentStatus;
++  status_reason: string | null;
+   contact_name: string | null;
+   contact_email: string | null;
+   applications: number;
+@@ -607,6 +609,64 @@ export interface AgentRow {
+   next_review_date: string | null;
+ }
+ 
++export type AgentStatus = "active" | "under_review" | "suspended" | "deactivated";
++export type EvidenceKind = "agreement" | "due_diligence";
++
++export interface AgentEvidence {
++  id: number;
++  filename: string;
++  uploaded_at: string;
++  uploaded_by: string | null;
++  available: boolean;
++}
++
++/** One agent as the register holds it (BRD FR-90, FR-91, FR-94). */
++export interface AgentDetail {
++  id: number;
++  name: string;
++  country_code: string;
++  country: string;
++  contact_name: string | null;
++  contact_email: string | null;
++  contact_phone: string | null;
++  status: AgentStatus;
++  status_reason: string | null;
++  due_diligence_date: string | null;
++  next_review_date: string | null;
++  refusal_rate_threshold_pct: number | null;
++  evidence: Record<EvidenceKind, AgentEvidence | null>;
++  /** Every file uploaded against the agent, newest first. */
++  evidence_history: { id: number; kind: EvidenceKind; filename: string; uploaded_at: string; uploaded_by: string | null;
++    status: "current" | "superseded" | "quarantined" }[];
++  created_at: string;
++  updated_at: string;
++}
++
++/** Who may change the register. Admissions reads it and attributes applications to it. */
++export const AGENT_EDITORS: Role[] = ["compliance", "senior", "admin"];
++
++export async function downloadAgentEvidence(agentId: number, kind: EvidenceKind, filename: string) {
++  await saveAs(`/agents/${agentId}/evidence/${kind}`, filename);
++}
++
++/** A specific file held against an agent, including a superseded one. */
++export async function downloadAgentDocument(agentId: number, documentId: number, filename: string) {
++  await saveAs(`/agents/${agentId}/documents/${documentId}`, filename);
++}
++
++async function saveAs(path: string, filename: string) {
++  const res = await request<Response>("GET", path, { raw: true });
++  const blob = await res.blob();
++  const url = URL.createObjectURL(blob);
++  const a = document.createElement("a");
++  a.href = url;
++  a.download = filename;
++  document.body.appendChild(a);
++  a.click();
++  a.remove();
++  setTimeout(() => URL.revokeObjectURL(url), 10_000);
++}
++
+ /** ISO alpha-2 → country name, fetched once per session. Falls back to the code on failure. */
+ let countryCache: Record<string, string> | null = null;
+ export async function countryNames(): Promise<Record<string, string>> {
+diff --git a/web/src/main.tsx b/web/src/main.tsx
+index cc994c1..8d1a1ca 100644
+--- a/web/src/main.tsx
++++ b/web/src/main.tsx
+@@ -10,6 +10,7 @@ import { Apply } from "./pages/Apply";
+ import { ForgotPassword, Register, ResetPassword, SignIn, VerifyEmail } from "./pages/Auth";
+ import { AcademicAssessment, ComplianceReview } from "./pages/Assessment";
+ import { CasApproval, CasRegister, PreCas } from "./pages/Cas";
++import { AgentDetail } from "./pages/AgentDetail";
+ import { Agents } from "./pages/Agents";
+ import { Dashboard } from "./pages/Dashboard";
+ import { Fees } from "./pages/Fees";
+@@ -71,6 +72,7 @@ createRoot(document.getElementById("root")!).render(
+           <Route path="/staff/events" element={<Guard roles={PRECAS}><ReportingQueue /></Guard>} />
+           <Route path="/staff/dashboard" element={<Guard roles={PRECAS}><Dashboard /></Guard>} />
+           <Route path="/staff/agents" element={<Guard roles={PRECAS}><Agents /></Guard>} />
++          <Route path="/staff/agents/:id" element={<Guard roles={PRECAS}><AgentDetail /></Guard>} />
+           <Route path="/staff/compliance" element={<Guard roles={COMPLIANCE}><ComplianceMonitoring /></Guard>} />
+           <Route path="/staff/reports" element={<Guard roles={COMPLIANCE}><Reports /></Guard>} />
+           <Route path="/admin/users" element={<Guard roles={["admin"]}><AdminUsers /></Guard>} />
+diff --git a/web/src/pages/AgentDetail.tsx b/web/src/pages/AgentDetail.tsx
+new file mode 100644
+index 0000000..5e588da
+--- /dev/null
++++ b/web/src/pages/AgentDetail.tsx
+@@ -0,0 +1,358 @@
++import { useEffect, useRef, useState, type FormEvent } from "react";
++import { Link, useNavigate, useParams } from "react-router-dom";
++import {
++  AGENT_EDITORS, api, ApiError, countryNames, downloadAgentDocument, downloadAgentEvidence, formatDate, formatDateTime,
++  type AgentDetail as Agent, type AgentStatus, type EvidenceKind,
++} from "../api";
++import { useAuth } from "../auth";
++import { Alert, DateField, ErrorSummary, Layout, SelectField, Spinner, TextArea, TextField, detailsToErrors } from "../components/ui";
++import { Confirm, LoadFailed } from "../components/workflow";
++
++/**
++ * One recruitment agent: its details, its status and the evidence held (BRD FR-90, FR-91, FR-94).
++ * Also the "add an agent" screen, at /staff/agents/new.
++ *
++ * Status is changed with its own action and a reason, never through the edit form: suspending an
++ * agent is a decision somebody is accountable for, and the reason is shown on the register.
++ */
++
++interface Form {
++  name: string; country: string; contact_name: string; contact_email: string; contact_phone: string;
++  due_diligence_date: string; next_review_date: string; refusal_rate_threshold_pct: string;
++}
++const EMPTY: Form = {
++  name: "", country: "", contact_name: "", contact_email: "", contact_phone: "",
++  due_diligence_date: "", next_review_date: "", refusal_rate_threshold_pct: "",
++};
++type Summary = { field: string | null; message: string }[];
++
++const STATUS_LABEL: Record<AgentStatus, string> = {
++  active: "Active", under_review: "Under review", suspended: "Suspended", deactivated: "Deactivated",
++};
++const STATUS_ACTIONS: Record<AgentStatus, { to: AgentStatus; label: string; consequence: string }[]> = {
++  active: [
++    { to: "under_review", label: "Put under review", consequence: "The agent can still be selected on applications while the review runs." },
++    { to: "suspended", label: "Suspend", consequence: "No new application can be attributed to this agent until it is reactivated. Submitted applications keep their attribution; a draft that names this agent cannot be submitted until the applicant chooses again." },
++    { to: "deactivated", label: "Deactivate", consequence: "For an agent ESE no longer works with. It stays on the register with its history and cannot be attributed new applications." },
++  ],
++  under_review: [
++    { to: "active", label: "Review complete — reactivate", consequence: "The agent returns to active. Record the new due-diligence and review dates as well." },
++    { to: "suspended", label: "Suspend", consequence: "No new application can be attributed to this agent until it is reactivated." },
++    { to: "deactivated", label: "Deactivate", consequence: "The agent stays on the register with its history and cannot be attributed new applications." },
++  ],
++  suspended: [
++    { to: "active", label: "Reactivate", consequence: "The agent can be selected on applications again." },
++    { to: "deactivated", label: "Deactivate", consequence: "The agent stays on the register with its history and cannot be attributed new applications." },
++  ],
++  deactivated: [
++    { to: "active", label: "Reactivate", consequence: "The agent can be selected on applications again." },
++  ],
++};
++const EVIDENCE: { kind: EvidenceKind; label: string; hint: string }[] = [
++  { kind: "agreement", label: "Agent agreement", hint: "The signed agreement between ESE and the agent." },
++  { kind: "due_diligence", label: "Due-diligence record", hint: "The checks made on the agent, dated." },
++];
++
++/** Today as YYYY-MM-DD in the browser's own time zone (toISOString would give the UTC date). */
++function localToday(): string {
++  const d = new Date();
++  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
++}
++
++function toForm(a: Agent): Form {
++  return {
++    name: a.name, country: a.country_code, contact_name: a.contact_name ?? "", contact_email: a.contact_email ?? "",
++    contact_phone: a.contact_phone ?? "", due_diligence_date: a.due_diligence_date ?? "",
++    next_review_date: a.next_review_date ?? "",
++    refusal_rate_threshold_pct: a.refusal_rate_threshold_pct === null ? "" : String(a.refusal_rate_threshold_pct),
++  };
++}
++
++/** The request body: blanks become null, and on an edit only what changed is sent. */
++function toBody(form: Form, original: Form | null): Record<string, string | number | null> {
++  const body: Record<string, string | number | null> = {};
++  (Object.keys(form) as (keyof Form)[]).forEach((k) => {
++    if (original && form[k].trim() === original[k].trim()) return;
++    const v = form[k].trim();
++    // Sent as typed. The server validates the threshold, so "10%" is refused with a message rather
++    // than turned into NaN, which JSON would send as null and silently clear the threshold.
++    body[k] = v === "" ? null : v;
++  });
++  return body;
++}
++
++function errorsFrom(err: unknown, setErrors: (e: Record<string, string>) => void, setSummary: (s: Summary) => void) {
++  if (err instanceof ApiError) {
++    setErrors(detailsToErrors(err.details));
++    setSummary(err.details.length
++      ? err.details.map((d) => ({ field: d.field, message: d.message ?? err.message }))
++      : [{ field: null, message: err.message }]);
++  } else {
++    setSummary([{ field: null, message: "Something went wrong. Try again." }]);
++  }
++}
++
++export function AgentDetail() {
++  const { id } = useParams();
++  const isNew = id === "new";
++  const navigate = useNavigate();
++  const { user } = useAuth();
++  const canEdit = !!user && AGENT_EDITORS.includes(user.role);
++
++  const [agent, setAgent] = useState<Agent | null>(null);
++  const [failed, setFailed] = useState(false);
++  const [countries, setCountries] = useState<{ value: string; label: string }[]>([]);
++  const [editing, setEditing] = useState(isNew);
++  const [form, setForm] = useState<Form>(EMPTY);
++  const [errors, setErrors] = useState<Record<string, string>>({});
++  const [summary, setSummary] = useState<Summary>([]);
++  const [notice, setNotice] = useState<string | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [downloadError, setDownloadError] = useState<string | null>(null);
++  const [pending, setPending] = useState<{ to: AgentStatus; label: string; consequence: string } | null>(null);
++  const [reason, setReason] = useState("");
++  const [statusError, setStatusError] = useState<string | null>(null);
++
++  useEffect(() => {
++    void countryNames().then((names) =>
++      setCountries(Object.entries(names).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label))));
++  }, []);
++
++  useEffect(() => {
++    if (isNew) return;
++    api.get<Agent>(`/agents/${id}`).then((a) => { setAgent(a); setForm(toForm(a)); }).catch(() => setFailed(true));
++  }, [id, isNew]);
++
++  async function save(e: FormEvent) {
++    e.preventDefault();
++    setErrors({}); setSummary([]); setNotice(null); setBusy(true);
++    try {
++      if (isNew) {
++        const created = await api.post<Agent>("/agents", toBody(form, null));
++        setAgent(created); setForm(toForm(created)); setEditing(false);
++        navigate(`/staff/agents/${created.id}`, { replace: true });
++        setNotice(`${created.name} added to the register.`);
++      } else if (agent) {
++        const body = toBody(form, toForm(agent));
++        if (Object.keys(body).length === 0) { setEditing(false); return; }
++        const updated = await api.patch<Agent>(`/agents/${agent.id}`, body);
++        setAgent(updated); setForm(toForm(updated)); setEditing(false);
++        setNotice("Changes saved. The previous values are recorded in the audit trail.");
++      }
++    } catch (err) {
++      errorsFrom(err, setErrors, setSummary);
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  async function changeStatus() {
++    if (!agent || !pending) return;
++    setBusy(true); setStatusError(null);
++    try {
++      const updated = await api.post<Agent>(`/agents/${agent.id}/status`,
++        { status: pending.to, reason: pending.to === "active" ? null : reason.trim() });
++      setAgent(updated); setPending(null); setReason("");
++      setNotice(`${updated.name} is now ${STATUS_LABEL[updated.status].toLowerCase()}.`);
++    } catch (err) {
++      setStatusError(err instanceof ApiError ? (err.details[0]?.message ?? err.message) : "The change could not be saved.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  if (failed) return <Layout><LoadFailed what="This agent" /></Layout>;
++  if (!isNew && !agent) return <Layout><Spinner /></Layout>;
++  if (isNew && !canEdit) return <Layout><Alert kind="error">Only compliance, the Authorising Officer or an administrator can add agents.</Alert></Layout>;
++
++  const set = (k: keyof Form) => (v: string) => setForm({ ...form, [k]: v });
++  const overdue = agent?.next_review_date && agent.next_review_date < localToday();
++
++  return (
++    <Layout>
++      <p><Link to="/staff/agents">← All agents</Link></p>
++      <div className="page-head">
++        <h1>{isNew ? "Add an agent" : agent!.name}</h1>
++        {agent && !editing && canEdit && (
++          <button type="button" className="button button-secondary" onClick={() => { setEditing(true); setNotice(null); }}>Edit details</button>
++        )}
++      </div>
++      {notice && <Alert kind="success">{notice}</Alert>}
++
++      {agent && agent.status !== "active" && (
++        <Alert kind={agent.status === "under_review" ? "warning" : "error"} title={STATUS_LABEL[agent.status]}>
++          <p>{agent.status_reason}</p>
++          {agent.status !== "under_review" && <p>New applications cannot be attributed to this agent.</p>}
++        </Alert>
++      )}
++      {agent && overdue && agent.status !== "suspended" && agent.status !== "deactivated" && (
++        <Alert kind="warning" title="Review overdue">
++          <p>The review was due on {formatDate(agent.next_review_date!)}. Record the new due-diligence and next review dates once it is done.</p>
++        </Alert>
++      )}
++
++      {editing ? (
++        <section className="card" aria-labelledby="details-h">
++          <h2 id="details-h" className="h3">{isNew ? "Agent details" : "Edit details"}</h2>
++          <ErrorSummary title="There is a problem" errors={summary} />
++          <form onSubmit={save} noValidate>
++            <TextField name="name" label="Agent name" required value={form.name} onChange={set("name")} error={errors.name}
++              hint="The trading name, as on the agreement." />
++            <SelectField name="country" label="Country" required value={form.country} onChange={set("country")} error={errors.country}
++              options={countries} />
++            <TextField name="contact_name" label="Contact name" value={form.contact_name} onChange={set("contact_name")} error={errors.contact_name} />
++            <TextField name="contact_email" label="Contact email" type="email" value={form.contact_email} onChange={set("contact_email")} error={errors.contact_email} />
++            <TextField name="contact_phone" label="Contact phone" type="tel" width="m" value={form.contact_phone} onChange={set("contact_phone")} error={errors.contact_phone}
++              hint="Include the country code, for example +234 803 123 4567." />
++            <DateField name="due_diligence_date" label="Due diligence last completed" value={form.due_diligence_date} onChange={set("due_diligence_date")} error={errors.due_diligence_date} />
++            <DateField name="next_review_date" label="Next review due" value={form.next_review_date} onChange={set("next_review_date")} error={errors.next_review_date}
++              hint="The compliance inbox is reminded ahead of this date, and again if it passes." />
++            <TextField name="refusal_rate_threshold_pct" label="Refusal-rate threshold (%)" width="s" inputMode="decimal"
++              value={form.refusal_rate_threshold_pct} onChange={set("refusal_rate_threshold_pct")} error={errors.refusal_rate_threshold_pct}
++              hint="The register flags the agent when its visa refusal rate goes above this. Leave blank for no threshold." />
++            <div className="actions">
++              <button className="button" type="submit" disabled={busy}>{busy ? "Saving…" : isNew ? "Add agent" : "Save changes"}</button>
++              <button type="button" className="button button-secondary" disabled={busy}
++                onClick={() => (isNew ? navigate("/staff/agents") : (setEditing(false), setForm(toForm(agent!)), setErrors({}), setSummary([])))}>
++                Cancel
++              </button>
++            </div>
++          </form>
++        </section>
++      ) : agent && (
++        <section className="card" aria-labelledby="details-h">
++          <h2 id="details-h" className="h3">Details</h2>
++          <dl className="kv">
++            <div><dt>Status</dt><dd><span className={`tag tag-${agent.status}`}>{STATUS_LABEL[agent.status]}</span></dd></div>
++            <div><dt>Country</dt><dd>{agent.country}</dd></div>
++            <div><dt>Contact</dt><dd>{agent.contact_name ?? <span className="hint">Not recorded</span>}</dd></div>
++            <div><dt>Email</dt><dd>{agent.contact_email ? <a href={`mailto:${agent.contact_email}`}>{agent.contact_email}</a> : <span className="hint">Not recorded</span>}</dd></div>
++            <div><dt>Phone</dt><dd>{agent.contact_phone ?? <span className="hint">Not recorded</span>}</dd></div>
++            <div><dt>Due diligence</dt><dd>{agent.due_diligence_date ? formatDate(agent.due_diligence_date) : <span className="hint">Not recorded</span>}</dd></div>
++            <div><dt>Next review</dt><dd>{agent.next_review_date ? formatDate(agent.next_review_date) : <span className="hint">Not set</span>}</dd></div>
++            <div><dt>Refusal-rate threshold</dt><dd>{agent.refusal_rate_threshold_pct !== null ? `${agent.refusal_rate_threshold_pct}%` : <span className="hint">None</span>}</dd></div>
++            <div><dt>Last changed</dt><dd>{formatDateTime(agent.updated_at)}</dd></div>
++          </dl>
++        </section>
++      )}
++
++      {agent && (
++        <section className="card" aria-labelledby="evidence-h">
++          <h2 id="evidence-h" className="h3">Agreement and due diligence</h2>
++          {downloadError && <Alert kind="error">{downloadError}</Alert>}
++          {EVIDENCE.map((e) => (
++            <EvidenceRow key={e.kind} agent={agent} kind={e.kind} label={e.label} hint={e.hint} canEdit={canEdit}
++              onDownloadError={setDownloadError}
++              onUploaded={(a) => { setAgent(a); setNotice(`${e.label} uploaded and scanned.`); }} />
++          ))}
++          {agent.evidence_history.some((h) => h.status !== "current") && (
++            <details className="evidence-history">
++              <summary>Earlier files ({agent.evidence_history.filter((h) => h.status !== "current").length})</summary>
++              <ul>
++                {agent.evidence_history.filter((h) => h.status !== "current").map((h) => (
++                  <li key={h.id}>
++                    {h.status === "superseded" ? (
++                      <button type="button" className="link-button"
++                        onClick={() => { setDownloadError(null); downloadAgentDocument(agent.id, h.id, h.filename).catch(() => setDownloadError("That file could not be downloaded.")); }}>
++                        {h.filename}
++                      </button>
++                    ) : <span>{h.filename}</span>}
++                    <span className="hint"> · {h.kind === "agreement" ? "Agreement" : "Due diligence"} · {formatDateTime(h.uploaded_at)}{h.uploaded_by ? ` by ${h.uploaded_by}` : ""} · </span>
++                    <span className={`tag tag-${h.status === "quarantined" ? "quarantined" : "pending"}`}>{h.status === "quarantined" ? "Failed security scan" : "Superseded"}</span>
++                  </li>
++                ))}
++              </ul>
++            </details>
++          )}
++        </section>
++      )}
++
++      {agent && canEdit && (
++        <section className="card" aria-labelledby="status-h">
++          <h2 id="status-h" className="h3">Status</h2>
++          {pending ? (
++            <Confirm title={pending.label} consequence={pending.consequence} confirmLabel={pending.label} busy={busy}
++              disabled={pending.to !== "active" && reason.trim().length < 10}
++              onConfirm={() => void changeStatus()} onCancel={() => { setPending(null); setReason(""); setStatusError(null); }}>
++              {statusError && <Alert kind="error">{statusError}</Alert>}
++              {pending.to !== "active" && (
++                <TextArea name="reason" label="Reason" required rows={3} maxLength={1000} minLength={10} value={reason} onChange={setReason}
++                  hint="Shown on the register and recorded in the audit trail." />
++              )}
++            </Confirm>
++          ) : (
++            <div className="actions">
++              {STATUS_ACTIONS[agent.status].map((a) => (
++                <button key={a.to} type="button"
++                  className={`button ${a.to === "suspended" || a.to === "deactivated" ? "button-warning" : "button-secondary"}`}
++                  onClick={() => { setPending(a); setNotice(null); }}>
++                  {a.label}
++                </button>
++              ))}
++            </div>
++          )}
++        </section>
++      )}
++    </Layout>
++  );
++}
++
++function EvidenceRow({ agent, kind, label, hint, canEdit, onUploaded, onDownloadError }: {
++  agent: Agent; kind: EvidenceKind; label: string; hint: string; canEdit: boolean;
++  onUploaded: (a: Agent) => void; onDownloadError: (message: string | null) => void;
++}) {
++  const doc = agent.evidence[kind];
++  const input = useRef<HTMLInputElement>(null);
++  const [file, setFile] = useState<File | null>(null);
++  const [busy, setBusy] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  async function upload(e: FormEvent) {
++    e.preventDefault();
++    if (!file) { setError("Choose a file to upload."); return; }
++    setBusy(true); setError(null);
++    const form = new FormData();
++    form.append("kind", kind);
++    form.append("file", file);
++    try {
++      const updated = await api.upload<Agent>(`/agents/${agent.id}/evidence`, form);
++      setFile(null);
++      if (input.current) input.current.value = "";
++      onUploaded(updated);
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : "The upload failed. Try again.");
++    } finally {
++      setBusy(false);
++    }
++  }
++
++  const inputId = `evidence-${kind}`;
++  return (
++    <div className="evidence-row">
++      <h3 className="h4">{label}</h3>
++      {doc ? (
++        <p>
++          <button type="button" className="link-button" disabled={!doc.available}
++            onClick={() => {
++              onDownloadError(null);
++              downloadAgentEvidence(agent.id, kind, doc.filename)
++                .catch((err) => onDownloadError(err instanceof ApiError ? err.message : "The file could not be downloaded. Try again."));
++            }}>{doc.filename}</button>
++          <span className="hint block">Uploaded {formatDateTime(doc.uploaded_at)}{doc.uploaded_by ? ` by ${doc.uploaded_by}` : ""}</span>
++        </p>
++      ) : (
++        <p className="hint">Nothing held yet.</p>
++      )}
++      {canEdit && (
++        <form onSubmit={upload} noValidate className="inline-upload">
++          {error && <Alert kind="error">{error}</Alert>}
++          <label htmlFor={inputId} className="label">{doc ? `Replace the ${label.toLowerCase()}` : `Choose the ${label.toLowerCase()} file`} <span className="optional">(PDF, JPG or PNG, up to 5MB)</span></label>
++          <p className="hint" id={`${inputId}-hint`}>{hint}{doc ? " The current file is kept on record as superseded." : ""}</p>
++          <input id={inputId} ref={input} type="file" accept=".pdf,.jpg,.jpeg,.png,application/pdf,image/jpeg,image/png"
++            aria-describedby={`${inputId}-hint`} onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
++          <button className="button button-secondary" type="submit" disabled={busy || !file}>{busy ? "Uploading and scanning…" : `Upload ${label.toLowerCase()}`}</button>
++        </form>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/pages/Agents.tsx b/web/src/pages/Agents.tsx
+index 8a104d8..be37c6a 100644
+--- a/web/src/pages/Agents.tsx
++++ b/web/src/pages/Agents.tsx
+@@ -1,12 +1,15 @@
+ import { useEffect, useState } from "react";
+-import { api, formatDate, type AgentRow } from "../api";
++import { Link } from "react-router-dom";
++import { AGENT_EDITORS, api, formatDate, type AgentRow } from "../api";
++import { useAuth } from "../auth";
+ import { Alert, Layout, Spinner } from "../components/ui";
+ import { LoadFailed } from "../components/workflow";
+ 
+ /**
+  * Recruitment agent register — prototype screen 11.
+  *
+- * Read-only in this release. The columns are the ones the prototype shows, with one addition the
++ * Compliance, the Authorising Officer and administrators add and maintain agents from here (BRD
++ * FR-90 to FR-94); admissions reads the register. The columns are the ones the prototype shows, with one addition the
+  * sponsor duty actually turns on: the visa refusal rate per agent, and whether it has passed the
+  * threshold recorded against that agent (FR-106, FR-107). Rates below five visa decisions are not
+  * shown at all rather than shown as a large percentage of a tiny sample.
+@@ -14,6 +17,8 @@ import { LoadFailed } from "../components/workflow";
+ export function Agents() {
+   const [rows, setRows] = useState<AgentRow[] | null>(null);
+   const [failed, setFailed] = useState(false);
++  const { user } = useAuth();
++  const canEdit = !!user && AGENT_EDITORS.includes(user.role);
+ 
+   useEffect(() => {
+     api.get<AgentRow[]>("/agents").then(setRows).catch(() => setFailed(true));
+@@ -28,6 +33,7 @@ export function Agents() {
+     <Layout>
+       <div className="page-head">
+         <h1>Recruitment agents</h1>
++        {canEdit && <Link className="button" to="/staff/agents/new">Add an agent</Link>}
+       </div>
+ 
+       {flagged.length > 0 && (
+@@ -63,7 +69,7 @@ export function Agents() {
+                 {rows.map((a) => (
+                   <tr key={a.id} className={a.refusal_rate_over_threshold ? "row-overdue" : undefined}>
+                     <td>
+-                      <b>{a.name}</b>
++                      <Link to={`/staff/agents/${a.id}`}><b>{a.name}</b></Link>
+                       {a.contact_name && <span className="hint block">{a.contact_name}</span>}
+                     </td>
+                     <td>{a.country}</td>
+@@ -92,15 +98,18 @@ export function Agents() {
+                       {a.due_diligence_date ? formatDate(a.due_diligence_date) : <span className="hint">Not recorded</span>}
+                       {a.next_review_date && <span className="hint block">Review {formatDate(a.next_review_date)}</span>}
+                     </td>
+-                    <td><span className={`tag tag-${a.status}`}>{a.status.replace(/_/g, " ")}</span></td>
++                    <td>
++                      <span className={`tag tag-${a.status}`}>{a.status.replace(/_/g, " ")}</span>
++                      {a.status_reason && <span className="hint block">{a.status_reason}</span>}
++                    </td>
+                   </tr>
+                 ))}
+               </tbody>
+             </table>
+           </div>
+           <p className="hint">
+-            Agreements, due-diligence records and refusal-rate monitoring are held against each agent.
+-            Adding and editing agents is not yet built — the register is maintained directly for now.
++            Open an agent for its contact details, agreement and due-diligence record.
++            Suspended and deactivated agents stay on the register with their history, and cannot be selected on new applications.
+           </p>
+         </>
+       )}
+diff --git a/web/src/styles.css b/web/src/styles.css
+index a7ec81a..8c515c6 100644
+--- a/web/src/styles.css
++++ b/web/src/styles.css
+@@ -283,7 +283,7 @@ code { font-family: ui-monospace, Consolas, monospace; font-size: 0.9em; backgro
+ .tag { display: inline-block; font-size: 11.5px; font-weight: 600; padding: 2px 9px; border-radius: 14px; background: #eef0f4; color: #41506b; text-transform: capitalize; }
+ .tag-clean, .tag-active { background: var(--green-l); color: var(--green); }
+ .tag-quarantined, .tag-deactivated, .tag-suspended, .tag-overdue { background: var(--red-l); color: var(--red); }
+-.tag-pending, .tag-outstanding { background: var(--amber-l); color: var(--amber); }
++.tag-pending, .tag-outstanding, .tag-under_review { background: var(--amber-l); color: var(--amber); }
+ .tag-rag-green { background: var(--green-l); color: var(--green); }
+ .tag-rag-amber { background: var(--amber-l); color: var(--amber); }
+ .tag-rag-red { background: var(--red-l); color: var(--red); }
+@@ -558,3 +558,11 @@ legend { padding: 0; }
+ .label[data-required]::after { content: " *"; color: #c62838; font-weight: 700; }
+ .verify-control { display: inline-flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+ .verify-control .error-summary { margin: 6px 0 0; padding: 8px 10px; }
++
++/* Agent register: evidence held against an agent (BRD FR-91) */
++.evidence-row { padding: 10px 0 14px; border-bottom: 1px solid #edf1f8; }
++.evidence-row:last-child { border-bottom: 0; }
++.inline-upload { display: grid; gap: 6px; justify-items: start; margin-top: 8px; }
++.evidence-history { margin-top: 12px; }
++.evidence-history ul { margin: 8px 0 0; padding-left: 18px; }
++.evidence-history li { margin: 4px 0; }

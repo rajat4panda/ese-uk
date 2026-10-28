@@ -1,0 +1,114 @@
+# Local development and training stack. Not a production topology (see README "Deployment").
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/bootstrap_db.sql:/bootstrap/bootstrap_db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+
+  db-bootstrap:
+    image: postgres:16
+    depends_on: { db: { condition: service_healthy } }
+    environment:
+      PGPASSWORD: postgres
+    volumes:
+      - ./scripts/bootstrap_db.sql:/bootstrap_db.sql:ro
+    # Both databases, in one pass. The test database is created alongside the development one so
+    # that running the suite never needs a second setup step — and never touches ese_dev, which a
+    # tester will have data in.
+    #
+    # The script stays on ONE line and the argv form is explicit. A YAML folded scalar (>) folds
+    # line breaks away only on lines at the base indentation; indent a continuation for
+    # readability and the break survives into the shell. That is what happened here — the command
+    # reached sh as four lines, the second of them starting "-v", and the container exited 127.
+    entrypoint:
+      - sh
+      - -c
+      - "for name in ese_dev ese_test; do psql -h db -U postgres -v ON_ERROR_STOP=1 -v owner_pw=ese_owner_local -v app_pw=ese_app_local -v dbname=$$name -f /bootstrap_db.sql || exit 1; done"
+
+  redis:
+    image: redis:7-alpine
+
+  clamav:
+    image: clamav/clamav:stable
+    profiles: ["av"]
+
+  api:
+    # Named explicitly: without a target, Docker builds the LAST stage in the Dockerfile, which is
+    # how the test image once ended up being built and run as the API.
+    build: { context: ., target: runtime }
+    depends_on:
+      db-bootstrap: { condition: service_completed_successfully }
+      redis: { condition: service_started }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ese_app:ese_app_local@db:5432/ese_dev
+      MIGRATION_DATABASE_URL: postgresql+psycopg://ese_owner:ese_owner_local@db:5432/ese_dev
+      REDIS_URL: redis://redis:6379/0
+      PUBLIC_BASE_URL: http://localhost:8000
+      # Hotfix: this stack is development, so no email is sent and no confirmation is needed.
+      # UAT deployments set ENVIRONMENT=uat; production sets ENVIRONMENT=production.
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      # Ten sign-ins a minute per address (LLD 16). The browser walkthroughs sign in as seven
+      # users in a row and all of them arrive from one container address, so a test run needs
+      # this raised — export it before `docker compose up`, and only in development.
+      RATE_LIMIT_AUTH_PER_MINUTE: ${RATE_LIMIT_AUTH_PER_MINUTE:-10}
+    # The log is teed to a file as well as stdout: with MAIL_BACKEND=console the registration and
+    # verification links are printed there, and the applicant journey test reads them out of it.
+    # One line, explicit argv — see the note on db-bootstrap's entrypoint. This one survived the
+    # same folding only because its line break happened to land straight after an `&&`.
+    command:
+      - sh
+      - -c
+      - "alembic upgrade head && python -m app.cli seed-reference && python -m app.cli seed-demo && uvicorn app.main:app --host 0.0.0.0 --port 8000 2>&1 | tee /srv/var/log/uvicorn.log"
+    ports: ["8000:8000"]
+    volumes:
+      - storage:/srv/var/storage
+      - logs:/srv/var/log
+
+  worker:
+    build: { context: ., target: runtime }
+    depends_on: [api]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ese_app:ese_app_local@db:5432/ese_dev
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+    command: python -m app.workers.scheduler
+
+  # Everything needed to run the tests, with no Python, Node or browser installed on the host.
+  #   docker compose --profile test run --rm tests pytest -q
+  #   docker compose --profile test run --rm tests python3 tests/e2e/sprint2_chain.py
+  # The working tree is mounted, so a change to a test is picked up without a rebuild.
+  tests:
+    build: { context: ., target: test }
+    profiles: ["test"]
+    depends_on:
+      db-bootstrap: { condition: service_completed_successfully }
+      redis: { condition: service_started }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ese_app:ese_app_local@db:5432/ese_test
+      MIGRATION_DATABASE_URL: postgresql+psycopg://ese_owner:ese_owner_local@db:5432/ese_test
+      REDIS_URL: redis://redis:6379/1
+      # The browser scripts drive the running application, which is the dev database, not the
+      # test one. They sign in as several users in a row, hence the relaxed limit.
+      E2E_BASE_URL: http://api:8000
+      E2E_SERVER_LOG: /srv/var/log/uvicorn.log
+      MAIL_BACKEND: memory
+    working_dir: /srv
+    volumes:
+      - .:/srv
+      # Read-only view of the application's log, for the one test that has to read an emailed link.
+      - logs:/srv/var/log:ro
+
+volumes:
+  pgdata:
+  storage:
+  logs:

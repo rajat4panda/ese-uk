@@ -1,0 +1,247 @@
+diff --git a/.env.example b/.env.example
+index fc8abf7..1de120f 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,5 +1,8 @@
+ # Copy to .env and fill in. Never commit .env (LLD Section 16 — secrets are environment-supplied).
+ ENVIRONMENT=development
++# development | uat | test | production. Email is sent, and applicants must confirm their
++# address, only in production (and the automated test environment). Override either with
++# EMAIL_ENABLED=true|false and EMAIL_VERIFICATION_REQUIRED=true|false; production refuses false.
+ 
+ # Application connects as a member of app_role (no UPDATE/DELETE on audit_entries).
+ DATABASE_URL=postgresql+psycopg://ese_app:change-me-app@localhost:5432/ese_dev
+diff --git a/app/api/auth.py b/app/api/auth.py
+index d218e3e..3630892 100644
+--- a/app/api/auth.py
++++ b/app/api/auth.py
+@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Request, Response, status
+ from sqlalchemy.orm import Session
+ 
+ from app.api.deps import CurrentUser, auth_rate_limit, client_ip, get_current
++from app.config import get_settings
+ from app.database import get_db
+ from app.errors import BadRequest
+ from app.schemas.auth import (
+@@ -73,7 +74,7 @@ def verify_email_confirm(body: VerifyEmailIn, request: Request, db: Session = De
+ 
+ @router.post("/auth/verify-email/resend", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(auth_rate_limit)])
+ def verify_email_resend(current: CurrentUser = Depends(get_current), db: Session = Depends(get_db)) -> dict:
+-    if current.user.email_verified_at is not None:
++    if current.user.email_verified_at is not None or not get_settings().email_verification_required:
+         raise BadRequest("ERR_ALREADY_VERIFIED", "Your email address is already confirmed.")
+     accounts.send_verification(db, current.user)
+     db.commit()
+diff --git a/app/config.py b/app/config.py
+index 398d4f8..8a8e8b4 100644
+--- a/app/config.py
++++ b/app/config.py
+@@ -17,7 +17,7 @@ PLACEHOLDER_SECRET = "replace-with-32-byte-random-secret"  # noqa: S105 — the
+ class Settings(BaseSettings):
+     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+ 
+-    ENVIRONMENT: Literal["development", "test", "production"] = "development"
++    ENVIRONMENT: Literal["development", "uat", "test", "production"] = "development"
+ 
+     DATABASE_URL: str = "postgresql+psycopg://ese_app:ese_app@localhost:5432/ese_dev"
+     MIGRATION_DATABASE_URL: str | None = None
+@@ -56,6 +56,14 @@ class Settings(BaseSettings):
+     SMTP_PASSWORD: str | None = None
+     SMTP_STARTTLS: bool = True
+ 
++    # Hotfix: email is a production concern. In development and UAT no email leaves the system
++    # (each message is written to the log instead) and applicants do not have to confirm their
++    # address before submitting. Leave both unset to follow ENVIRONMENT; set true or false to
++    # override, e.g. EMAIL_VERIFICATION_REQUIRED=true to exercise the confirmation flow in UAT.
++    # Production refuses to start with either turned off.
++    EMAIL_ENABLED: bool | None = None
++    EMAIL_VERIFICATION_REQUIRED: bool | None = None
++
+     PUBLIC_BASE_URL: str = "http://localhost:5173"
+     SERVE_WEB_CLIENT: bool = True  # serve web/dist from the API process when present
+     SENTRY_DSN: str | None = None
+@@ -68,6 +76,22 @@ class Settings(BaseSettings):
+     def is_production(self) -> bool:
+         return self.ENVIRONMENT == "production"
+ 
++    @property
++    def _email_default(self) -> bool:
++        # Off only in the non-production environments people click through. The automated test
++        # environment keeps both on, so the verification and notification tests still run.
++        return self.ENVIRONMENT not in ("development", "uat")
++
++    @property
++    def email_enabled(self) -> bool:
++        return self._email_default if self.EMAIL_ENABLED is None else self.EMAIL_ENABLED
++
++    @property
++    def email_verification_required(self) -> bool:
++        if self.EMAIL_VERIFICATION_REQUIRED is None:
++            return self._email_default
++        return self.EMAIL_VERIFICATION_REQUIRED
++
+     @model_validator(mode="after")
+     def _refuse_default_secret(self) -> "Settings":
+         # LLD 19: "SECRET_KEY must be set — application refuses to start on the default".
+@@ -83,6 +107,8 @@ class Settings(BaseSettings):
+                 raise ValueError("Production requires ANTIVIRUS_BACKEND=clamav (FR-22).")
+             if self.MAIL_BACKEND != "smtp":
+                 raise ValueError("Production requires MAIL_BACKEND=smtp.")
++            if not self.email_enabled or not self.email_verification_required:
++                raise ValueError("Production requires EMAIL_ENABLED and EMAIL_VERIFICATION_REQUIRED to be on.")
+             if not self.MIGRATION_DATABASE_URL or self.MIGRATION_DATABASE_URL == self.DATABASE_URL:
+                 # If the app login owned the tables, the audit REVOKE would not bind it (NFR-12).
+                 raise ValueError(
+diff --git a/app/schemas/auth.py b/app/schemas/auth.py
+index 77ebfc4..fe7e6fd 100644
+--- a/app/schemas/auth.py
++++ b/app/schemas/auth.py
+@@ -6,6 +6,7 @@ from datetime import datetime
+ 
+ from pydantic import BaseModel, ConfigDict, EmailStr, Field
+ 
++from app.config import get_settings
+ from app.models.enums import UserRole, UserStatus
+ 
+ 
+@@ -78,7 +79,8 @@ class StaffOut(BaseModel):
+ 
+ def user_out(u) -> UserOut:  # noqa: ANN001
+     return UserOut(id=u.id, name=u.full_name, email=u.email, role=u.role,
+-                   email_verified=u.email_verified_at is not None)  # fmt: skip
++                   email_verified=u.email_verified_at is not None
++                   or not get_settings().email_verification_required)  # fmt: skip
+ 
+ 
+ def staff_out(u) -> StaffOut:  # noqa: ANN001
+diff --git a/app/services/accounts.py b/app/services/accounts.py
+index d9c8ab1..0fc6e02 100644
+--- a/app/services/accounts.py
++++ b/app/services/accounts.py
+@@ -91,6 +91,8 @@ def register(db: Session, email: str, password: str, full_name: str, ip: str | N
+ 
+ def send_verification(db: Session, user: User) -> None:
+     s = get_settings()
++    if not s.email_verification_required:
++        return  # development / UAT: no confirmation step, so no link to send
+     plaintext, digest = new_link_token()
+     db.add(EmailVerificationToken(
+         user_id=user.id, token_hash=digest, expires_at=_now() + timedelta(hours=s.EMAIL_VERIFICATION_HOURS)
+diff --git a/app/services/applications.py b/app/services/applications.py
+index 442ca18..5f3f8c2 100644
+--- a/app/services/applications.py
++++ b/app/services/applications.py
+@@ -13,6 +13,7 @@ from pydantic import ValidationError
+ from sqlalchemy import and_, func, or_, select, text
+ from sqlalchemy.orm import Session
+ 
++from app.config import get_settings
+ from app.errors import Conflict, GuardFailed, NotFound
+ from app.models.agent import ATTRIBUTABLE_AGENT_STATUSES, Agent
+ from app.models.application import Application
+@@ -278,7 +279,7 @@ def submission_problems(db: Session, app: Application, applicant: User) -> list[
+     # Account email must be verified and match (Appendix A step 1)
+     if d.email is not None and d.email != applicant.email.lower():
+         add("email", "ERR_EMAIL_MISMATCH", "Use the email address you registered with.")
+-    if applicant.email_verified_at is None:
++    if applicant.email_verified_at is None and get_settings().email_verification_required:
+         add("email", "ERR_EMAIL_NOT_VERIFIED", "Confirm your email address using the link we sent you.")
+ 
+     # References and intake-relative dates
+diff --git a/app/services/notifications.py b/app/services/notifications.py
+index b75c598..6e5509b 100644
+--- a/app/services/notifications.py
++++ b/app/services/notifications.py
+@@ -152,10 +152,12 @@ def send(template_key: str, recipient: str, payload: dict) -> OutboundMessage:
+ 
+ 
+ def _deliver(msg: OutboundMessage) -> None:
+-    backend = get_settings().MAIL_BACKEND
++    s = get_settings()
++    backend = s.MAIL_BACKEND
+     if backend == "memory":
+         OUTBOX.append(msg)
+-    elif backend == "console":
++    elif backend == "console" or not s.email_enabled:
++        # Development and UAT never send, whatever MAIL_BACKEND says: the message goes to the log.
+         log.warning("EMAIL (console backend) to=%s subject=%s\n%s", msg.recipient, msg.subject, msg.body)
+     else:
+         # Off the request thread: send latency must not reveal whether an account exists.
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 001aa8e..6930184 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -52,6 +52,9 @@ services:
+       MIGRATION_DATABASE_URL: postgresql+psycopg://ese_owner:ese_owner_local@db:5432/ese_dev
+       REDIS_URL: redis://redis:6379/0
+       PUBLIC_BASE_URL: http://localhost:8000
++      # Hotfix: this stack is development, so no email is sent and no confirmation is needed.
++      # UAT deployments set ENVIRONMENT=uat; production sets ENVIRONMENT=production.
++      ENVIRONMENT: ${ENVIRONMENT:-development}
+       # Ten sign-ins a minute per address (LLD 16). The browser walkthroughs sign in as seven
+       # users in a row and all of them arrive from one container address, so a test run needs
+       # this raised — export it before `docker compose up`, and only in development.
+@@ -76,6 +79,7 @@ services:
+     environment:
+       DATABASE_URL: postgresql+psycopg://ese_app:ese_app_local@db:5432/ese_dev
+       REDIS_URL: redis://redis:6379/0
++      ENVIRONMENT: ${ENVIRONMENT:-development}
+     command: python -m app.workers.scheduler
+ 
+   # Everything needed to run the tests, with no Python, Node or browser installed on the host.
+diff --git a/tests/integration/test_email_by_environment.py b/tests/integration/test_email_by_environment.py
+new file mode 100644
+index 0000000..2ef1d1a
+--- /dev/null
++++ b/tests/integration/test_email_by_environment.py
+@@ -0,0 +1,50 @@
++"""Hotfix: no email and no email confirmation in development and UAT; production unchanged."""
++
++from __future__ import annotations
++
++import pytest
++
++from app.config import get_settings
++from app.services import notifications
++from tests.fixtures import API, PASSWORD, submit_application
++
++
++@pytest.fixture
++def uat(monkeypatch):
++    monkeypatch.setenv("ENVIRONMENT", "uat")
++    monkeypatch.setenv("MAIL_BACKEND", "smtp")  # even if SMTP is configured, nothing must be sent
++    get_settings.cache_clear()
++    sent: list = []
++    monkeypatch.setattr(notifications, "_send_smtp", lambda msg: sent.append(msg))
++    yield sent
++    get_settings.cache_clear()
++
++
++@pytest.mark.parametrize("env", ["development", "uat"])
++def test_email_off_outside_production(monkeypatch, env):
++    monkeypatch.setenv("ENVIRONMENT", env)
++    get_settings.cache_clear()
++    try:
++        s = get_settings()
++        assert s.email_enabled is False
++        assert s.email_verification_required is False
++    finally:
++        get_settings.cache_clear()
++
++
++def test_uat_applicant_can_submit_without_confirming_email(client, reference, uat):
++    r = client.post(f"{API}/auth/register",
++                    json={"email": "uat.user@example.com", "password": PASSWORD, "full_name": "Uat User"})
++    assert r.status_code == 201, r.text
++    assert r.json()["user"]["email_verified"] is True  # no "Confirm your email address" banner
++    headers = {"Authorization": f"Bearer {r.json()['token']}"}
++
++    class A:
++        pass
++
++    applicant = A()
++    applicant.headers = headers
++    app_id = client.post(f"{API}/applications", headers=headers).json()["id"]
++    submit_application(client, applicant, app_id, reference)
++    assert uat == []  # nothing went to SMTP
++    assert client.post(f"{API}/auth/verify-email/resend", headers=headers).status_code == 400

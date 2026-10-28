@@ -1,0 +1,39 @@
+# Test runner, in a file of its own.
+#
+# This used to be a `profiles: ["test"]` service inside docker-compose.yml. That was wrong: Compose
+# builds with Bake, and Bake builds every service defined in the file regardless of profile. So a
+# plain `docker compose up --build` built the test image too — meaning a fault in the test stage
+# stopped the application from starting at all, and everyone running the app paid for a Chromium
+# download they had no use for. A separate file cannot be built by accident.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml run --rm tests pytest -q
+#
+# The working tree is mounted, so a change to a test is picked up without a rebuild.
+services:
+  tests:
+    build: { context: ., target: test }
+    # Belt and braces: the separate file stops `up --build` building this image, and the profile
+    # stops `up` with both files starting a container whose job is to run once and exit.
+    # `docker compose run` enables a service's own profile, so the documented commands still work.
+    profiles: ["test"]
+    depends_on:
+      db-bootstrap: { condition: service_completed_successfully }
+      redis: { condition: service_started }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://ese_app:ese_app_local@db:5432/ese_test
+      MIGRATION_DATABASE_URL: postgresql+psycopg://ese_owner:ese_owner_local@db:5432/ese_test
+      REDIS_URL: redis://redis:6379/1
+      # The browser scripts drive the running application, which is the dev database, not the
+      # test one. They sign in as several users in a row, hence the relaxed limit.
+      E2E_BASE_URL: http://api:8000
+      E2E_SERVER_LOG: /srv/var/log/uvicorn.log
+      MAIL_BACKEND: memory
+    working_dir: /srv
+    volumes:
+      - .:/srv
+      # Read-only view of the application's log, for the one test that has to read an emailed link.
+      - logs:/srv/var/log:ro
+
+volumes:
+  logs:
